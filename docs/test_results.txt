@@ -1,0 +1,10 @@
+test_01_login_presence_private_and_broadcast (test_integration.NetworkTests.test_01_login_presence_private_and_broadcast) ... ok
+test_02_binary_file_and_sha256 (test_integration.NetworkTests.test_02_binary_file_and_sha256) ... ok
+test_03_empty_file (test_integration.NetworkTests.test_03_empty_file) ... ok
+test_04_duplicate_user_rejected (test_integration.NetworkTests.test_04_duplicate_user_rejected) ... ok
+test_05_disconnect_cleanup (test_integration.NetworkTests.test_05_disconnect_cleanup) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 13.444s
+
+OK

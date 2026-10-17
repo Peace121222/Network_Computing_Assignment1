@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Collab LAN</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body><main>
+<h1>Collab LAN</h1>
+<p class="muted">User: <b id="self"></b> · <span id="connection" role="status">Connecting...</span></p>
+<p>Online: <span id="online">Connecting...</span></p>
+<div id="messages" role="log" aria-live="polite"></div>
+<section>
+<select id="to" aria-label="Recipient"><option value="*">Everyone</option></select>
+<input id="message" maxlength="1000" placeholder="Type a message" aria-label="Message">
+<button id="send-chat" onclick="sendChat()" disabled>Send</button>
+</section>
+<section>
+<input type="file" id="file" aria-label="File to send">
+<button id="send-file" onclick="sendFile()" disabled>Send file (max 25 MiB)</button>
+</section>
+<div id="transfers" aria-label="File transfers"></div>
+<p id="status" class="muted" role="status">Ready</p>
+</main>
+<script src="/static/app.js" defer></script>
+</body></html>

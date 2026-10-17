@@ -1,59 +1,123 @@
-"""Wire format, encrypted UDP frames and framed TCP control messages."""
-import base64
-import json
-import os
-import socket
-import struct
-from cryptography.fernet import Fernet, InvalidToken
+"""Compatibility imports for the shared protocol and transport API."""
 
-MAX_FRAME = 2_000_000
-UDP_MTU = 1100
-CHUNK = 320
+from collab.shared.limits import (
+    MAX_FRAME,
+    UDP_MTU,
+    CHUNK,
+    MAX_FILE_SIZE,
+    MAX_CHUNKS,
+    MAX_USERNAME,
+    MAX_PACKET_ID,
+    MAX_FILENAME,
+    MAX_CHAT_CHARS,
+    MAX_ERROR_CHARS,
+    SEND_WINDOW,
+    CLIENT_RETRIES,
+    SERVER_RETRIES,
+    RETRY_TIMEOUT,
+    CONNECT_TIMEOUT,
+    CLIENT_LOGIN_TIMEOUT,
+    LOGOUT_TIMEOUT,
+    SHUTDOWN_TIMEOUT,
+    CONTROL_TIMEOUT,
+    LOGIN_TIMEOUT,
+    SESSION_TIMEOUT,
+    HEARTBEAT_INTERVAL,
+    SESSION_EXPIRY,
+    SESSION_CHECK_INTERVAL,
+    UDP_TIMEOUT,
+    SERVER_POLL_TIMEOUT,
+    RETRY_POLL_INTERVAL,
+    SEND_POLL_INTERVAL,
+    MAX_SEEN_PACKETS,
+    CHAT_SERVER_TIMEOUT,
+    CHAT_CONFIRM_TIMEOUT,
+    CHAT_CACHE_TTL,
+    CHAT_CACHE_LIMIT,
+    CHAT_OUTGOING_LIMIT,
+    CHAT_GAP_TIMEOUT,
+    CHAT_STREAM_WINDOW,
+    CHAT_STREAM_LIMIT,
+    CHAT_FAILURE_REASONS,
+    TCP_TYPES,
+    CLIENT_UDP_TYPES,
+    SERVER_UDP_TYPES,
+    DATA_KINDS,
+)
+from collab.shared.protocol import (
+    valid_name,
+    validate_tcp,
+    validate_udp,
+    data_packet,
+    b64,
+    unb64,
+)
+from collab.transport.tcp import (
+    set_deadline_timeout,
+    send_tcp,
+    recv_exact,
+    TCPReader,
+    recv_tcp,
+)
+from collab.transport.udp import get_key, cipher, udp_frame_size, encode_udp, decode_udp
 
-def get_key():
-    key = os.getenv('COLLAB_KEY', '')
-    if not key:
-        raise RuntimeError('Set COLLAB_KEY (generate with python -m collab.keygen)')
-    return key.encode('ascii')
-
-def cipher():
-    return Fernet(get_key())
-
-def send_tcp(sock, data):
-    raw = json.dumps(data, separators=(',', ':')).encode()
-    if len(raw) > MAX_FRAME:
-        raise ValueError('TCP frame too large')
-    sock.sendall(struct.pack('!I', len(raw)) + raw)
-
-def recv_exact(sock, n):
-    result = bytearray()
-    while len(result) < n:
-        chunk = sock.recv(n-len(result))
-        if not chunk:
-            raise ConnectionError('TCP socket closed')
-        result.extend(chunk)
-    return bytes(result)
-
-def recv_tcp(sock):
-    size = struct.unpack('!I', recv_exact(sock, 4))[0]
-    if size > MAX_FRAME:
-        raise ValueError('TCP frame too large')
-    return json.loads(recv_exact(sock, size))
-
-def encode_udp(msg, f):
-    raw = f.encrypt(json.dumps(msg, separators=(',', ':')).encode())
-    if len(raw) > UDP_MTU:
-        raise ValueError('UDP frame exceeds limit')
-    return raw
-
-def decode_udp(raw, f):
-    try:
-        return json.loads(f.decrypt(raw))
-    except (InvalidToken, ValueError, UnicodeError, json.JSONDecodeError):
-        return None
-
-def b64(raw):
-    return base64.b64encode(raw).decode('ascii')
-
-def unb64(value):
-    return base64.b64decode(value, validate=True)
+__all__ = [
+    "MAX_FRAME",
+    "UDP_MTU",
+    "CHUNK",
+    "MAX_FILE_SIZE",
+    "MAX_CHUNKS",
+    "MAX_USERNAME",
+    "MAX_PACKET_ID",
+    "MAX_FILENAME",
+    "MAX_CHAT_CHARS",
+    "MAX_ERROR_CHARS",
+    "SEND_WINDOW",
+    "CLIENT_RETRIES",
+    "SERVER_RETRIES",
+    "RETRY_TIMEOUT",
+    "CONNECT_TIMEOUT",
+    "CLIENT_LOGIN_TIMEOUT",
+    "LOGOUT_TIMEOUT",
+    "SHUTDOWN_TIMEOUT",
+    "CONTROL_TIMEOUT",
+    "LOGIN_TIMEOUT",
+    "SESSION_TIMEOUT",
+    "HEARTBEAT_INTERVAL",
+    "SESSION_EXPIRY",
+    "SESSION_CHECK_INTERVAL",
+    "UDP_TIMEOUT",
+    "SERVER_POLL_TIMEOUT",
+    "RETRY_POLL_INTERVAL",
+    "SEND_POLL_INTERVAL",
+    "MAX_SEEN_PACKETS",
+    "CHAT_SERVER_TIMEOUT",
+    "CHAT_CONFIRM_TIMEOUT",
+    "CHAT_CACHE_TTL",
+    "CHAT_CACHE_LIMIT",
+    "CHAT_OUTGOING_LIMIT",
+    "CHAT_GAP_TIMEOUT",
+    "CHAT_STREAM_WINDOW",
+    "CHAT_STREAM_LIMIT",
+    "CHAT_FAILURE_REASONS",
+    "TCP_TYPES",
+    "CLIENT_UDP_TYPES",
+    "SERVER_UDP_TYPES",
+    "DATA_KINDS",
+    "valid_name",
+    "validate_tcp",
+    "validate_udp",
+    "data_packet",
+    "b64",
+    "unb64",
+    "set_deadline_timeout",
+    "send_tcp",
+    "recv_exact",
+    "TCPReader",
+    "recv_tcp",
+    "get_key",
+    "cipher",
+    "udp_frame_size",
+    "encode_udp",
+    "decode_udp",
+]

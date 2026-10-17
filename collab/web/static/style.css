@@ -1,0 +1,7 @@
+
+body{font:15px system-ui;background:#f1f5f9;color:#172134;margin:0}
+main{max-width:850px;margin:24px auto;padding:24px;background:white;border-radius:14px;box-shadow:0 4px 20px #0001}
+h1{margin-top:0}#messages{height:310px;overflow:auto;border:1px solid #cbd5e1;background:#fbfdff;padding:14px;border-radius:8px;margin:12px 0;white-space:pre-wrap}
+input,select,button{padding:10px;border:1px solid #94a3b8;border-radius:7px;font:inherit}button{cursor:pointer;background:#174c91;color:white}button:disabled{opacity:.5;cursor:default}
+section{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}#message{flex:1;min-width:180px}.muted{color:#52667f}
+.transfer{border:1px solid #cbd5e1;border-radius:8px;padding:10px;margin:8px 0;overflow-wrap:anywhere}.transfer progress{width:100%}.transfer p{margin:4px 0}

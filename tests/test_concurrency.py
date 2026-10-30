@@ -14,12 +14,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
-from collab.client import Client, TransferCapacityError
+from tests.auth_support import Client, TransferCapacityError
 from collab.common import b64, encode_udp, recv_tcp, send_tcp
 from collab.shared.concurrency import BoundedExecutor
-from collab.server import Server
+from tests.auth_support import Server
 from collab.transport.security import Channel
-from collab.transport.handshake import client_login
+from tests.auth_support import client_login, tls_connection
 
 
 def wait_for(test, predicate, timeout=5):
@@ -277,9 +277,11 @@ class ConcurrencyNetworkTests(unittest.TestCase):
                 patch("threading.Thread.start", new=start),
                 self.assertLogs("collab.server", level="DEBUG"),
             ):
-                with socket.create_connection(
-                    ("127.0.0.1", self.server.tcp_port), timeout=1
-                ) as sock:
+                with (
+                    tls_connection
+                    if target_name == "control_writer"
+                    else socket.create_connection
+                )(("127.0.0.1", self.server.tcp_port), timeout=1) as sock:
                     if target_name == "control_writer":
                         client_login(
                             sock, "writer_fail", self.server.f, time.monotonic() + 1

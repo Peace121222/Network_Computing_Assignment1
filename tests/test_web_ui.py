@@ -14,8 +14,8 @@ import unittest
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
-from collab.client import Client
-from collab.server import Server
+from tests.auth_support import Client
+from tests.auth_support import Server
 from collab.web.handlers import PAGE, STATIC_DIR, handler_factory
 from collab.web.runtime import BoundedHTTPServer
 
@@ -111,13 +111,13 @@ class WebUIIntegrationTests(unittest.TestCase):
         status, raw = self.get("/")
         self.assertEqual(status, 200)
         self.assertIn(b'<script src="/static/app.js" defer></script>', raw)
-        self.a.chat("bob", "Hello <b>Bob</b> — tiếng Việt")
+        self.a.chat("bob", "Hello <b>Bob</b> — English text")
         snapshot = self.events()
         self.assertEqual(snapshot["names"], ["alice", "bob"])
         self.assertEqual(snapshot["status"], "connected")
         chat = next(e for e in snapshot["events"] if e["type"] == "chat")
         self.assertEqual(chat["from"], "alice")
-        self.assertEqual(chat["text"], "Hello <b>Bob</b> — tiếng Việt")
+        self.assertEqual(chat["text"], "Hello <b>Bob</b> — English text")
         self.a.close()
         wait(self, lambda: self.b.names == ["bob"])
         self.assertEqual(self.events()["names"], ["bob"])

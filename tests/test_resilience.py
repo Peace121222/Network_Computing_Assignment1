@@ -17,10 +17,10 @@ import unittest
 from unittest.mock import Mock, patch
 from cryptography.fernet import Fernet
 
-from collab.client import Client
+from tests.auth_support import Client, ROOT, PASSWORD
 from collab.client import core as client_core
 from collab.client import cli as client_cli
-from collab.server import Server
+from tests.auth_support import Server
 from collab.server import core as server_core
 from collab.shared.resilience import RetryDelay, SendBackoff, retryable
 from collab.shared.concurrency import BoundedExecutor
@@ -106,8 +106,8 @@ class CLITests(unittest.TestCase):
     def invoke(self, client, commands):
         out, err = io.StringIO(), io.StringIO()
         with (
-            patch.object(client_cli, "Client", return_value=client),
-            patch("sys.argv", ["client", "--name", "alice"]),
+            patch.object(client_cli, "authenticate", return_value=client),
+            patch("sys.argv", ["client", "--name", "alice", "--ca", "fixture-ca"]),
             patch("builtins.input", side_effect=commands),
             contextlib.redirect_stdout(out),
             contextlib.redirect_stderr(err),
@@ -163,22 +163,27 @@ class CLITests(unittest.TestCase):
             self.assertEqual(code, 0)
             client._close_before.assert_called_once()
 
-    def test_startup_and_cleanup_failures_are_both_reported(self):
-        client = self.client()
-        client.connect.side_effect = ConnectionRefusedError("connect rejected")
-        client._close_before.side_effect = RuntimeError("cleanup blocked")
-        with self.assertLogs("collab.client", level="ERROR"):
-            code, _, err = self.invoke(client, [])
-        self.assertEqual(code, 1)
-        self.assertIn("connect rejected", err)
-        self.assertIn("cleanup blocked", err)
+    def test_startup_failure_is_reported(self):
+        with (
+            patch.object(
+                client_cli,
+                "authenticate",
+                side_effect=ConnectionRefusedError("connect rejected"),
+            ),
+            patch("sys.argv", ["client", "--ca", "fixture-ca"]),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            self.assertEqual(client_cli.main(), 1)
+        self.assertIn("connect rejected", err.getvalue())
 
     def test_server_cli_stops_on_fatal_worker(self):
         server = Mock()
         server.last_error = {"worker": "udp_loop", "message": "fatal UDP"}
         with (
             patch.object(server_core, "Server", return_value=server),
-            patch("sys.argv", ["server"]),
+            patch(
+                "sys.argv", ["server", "--cert", "fixture-cert", "--key", "fixture-key"]
+            ),
             contextlib.redirect_stderr(io.StringIO()) as err,
         ):
             self.assertEqual(server_core.main(), 1)
@@ -186,16 +191,17 @@ class CLITests(unittest.TestCase):
         server.close.assert_called_once()
         self.assertIn("fatal UDP", err.getvalue())
 
-    def test_web_connect_failure_closes_client(self):
-        client = self.client()
-        client.connect.side_effect = ConnectionRefusedError("no server")
+    def test_web_auth_failure_does_not_open_http(self):
         with (
-            patch.object(web_cli, "Client", return_value=client),
-            patch("sys.argv", ["web", "--name", "alice"]),
+            patch.object(
+                web_cli, "authenticate", side_effect=ConnectionRefusedError("no server")
+            ),
+            patch.object(web_cli, "BoundedHTTPServer") as http,
+            patch("sys.argv", ["web", "--ca", "fixture-ca"]),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(web_cli.main(), 1)
-        client.close.assert_called_once()
+        http.assert_not_called()
 
 
 class NetworkResilienceTests(unittest.TestCase):
@@ -426,15 +432,24 @@ class NetworkResilienceTests(unittest.TestCase):
         script = """
 import sys, threading
 from collab.client import Client
-c=Client('victim',port=int(sys.argv[1]),download_dir=sys.argv[2]); c.connect()
+c=Client('victim',port=int(sys.argv[1]),download_dir=sys.argv[2],cafile=sys.argv[3]); c.connect(sys.argv[4])
 import hashlib
 meta={'transfer':'d'*32,'filename':'partial.bin','size':1,'count':1,'sha256':hashlib.sha256(b'x').hexdigest()}
 c.send_packets([c.packet('healthy','file_start','',meta)])
 print('ready',flush=True)
 threading.Event().wait()
 """
+        self.server.accounts.register("victim", PASSWORD)
         process = subprocess.Popen(
-            [sys.executable, "-c", script, str(self.server.tcp_port), self.temp.name],
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.server.tcp_port),
+                self.temp.name,
+                str(ROOT / "ca.crt"),
+                PASSWORD,
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

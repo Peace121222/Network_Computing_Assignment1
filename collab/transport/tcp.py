@@ -5,6 +5,7 @@ from typing import Any
 from collab.transport.security import Channel
 
 
+import ssl
 import json
 import select
 import socket
@@ -64,6 +65,7 @@ class TCPReader:
         self.body = bytearray()
         self.size = None
         self.failed = False
+        self.max_frame = MAX_FRAME
         self.wait_timeout = SESSION_TIMEOUT
         self.stop_event = None
 
@@ -87,7 +89,12 @@ class TCPReader:
                 ):
                     continue
                 raise
-            except (BlockingIOError, InterruptedError):
+            except (
+                BlockingIOError,
+                InterruptedError,
+                ssl.SSLWantReadError,
+                ssl.SSLWantWriteError,
+            ):
                 remaining = (
                     self.wait_timeout
                     if deadline is None
@@ -116,7 +123,7 @@ class TCPReader:
                     <= (
                         encrypted_size(MAX_FRAME)
                         if self.security is not None
-                        else MAX_FRAME
+                        else self.max_frame
                     ),
                     "Invalid TCP frame length",
                 )
@@ -169,7 +176,12 @@ def write_tcp(
             raise TimeoutError("TCP control write deadline exceeded")
         try:
             count = sock.send(frame)
-        except (BlockingIOError, InterruptedError):
+        except (
+            BlockingIOError,
+            InterruptedError,
+            ssl.SSLWantReadError,
+            ssl.SSLWantWriteError,
+        ):
             continue
         if count == 0:
             raise ConnectionError("TCP control socket closed")

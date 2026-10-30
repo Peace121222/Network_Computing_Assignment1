@@ -13,8 +13,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
-from collab.client import Client
-from collab.server import Server
+from tests.auth_support import Client
+from tests.auth_support import Server
 from collab.transport.security import (
     Channel,
     HEADER,
@@ -30,7 +30,8 @@ from collab.transport.security import (
 from collab.transport.tcp import TCPReader, frame_tcp, send_tcp
 from collab.transport.udp import cipher, encode_udp, decode_udp, udp_frame_size
 from collab.transport.handshake import client_login
-from test_handshake import Stream, LoginStream, frame
+from tests.auth_support import tls_connection, PASSWORD, client_login as fixture_login
+from tests.test_handshake import Stream, LoginStream, frame
 
 
 def wait(test, predicate, timeout=3):
@@ -135,7 +136,7 @@ class EnvelopeTests(unittest.TestCase):
 
     def test_ciphertext_size_estimate_includes_security_header(self):
         for size in range(700):
-            message = {"payload": "ế" * (size // 3)}
+            message = {"payload": "界" * (size // 3)}
             try:
                 raw = encode_udp(message, self.f, self.sender)
             except ValueError:
@@ -193,30 +194,24 @@ class EnvelopeTests(unittest.TestCase):
                 "collab.transport.tcp.time.monotonic", side_effect=lambda: next(ticks)
             ):
                 with self.assertRaises(TimeoutError):
-                    client_login(stream, "alice", cipher(), 10.5)
+                    client_login(stream, "alice", PASSWORD, 10.15)
             self.assertTrue(stream.timeouts)
             self.assertTrue(
                 all(a >= b for a, b in zip(stream.timeouts, stream.timeouts[1:]))
             )
 
-    def test_key_validation_precedes_socket_creation(self):
-        for value in (
-            "",
-            "invalid",
-            "ế",
-            "!" + Fernet.generate_key().decode(),
-            base64.urlsafe_b64encode(b"x" * 31).decode(),
-        ):
+    def test_legacy_group_key_is_not_an_authentication_requirement(self):
+        for value in ("", "invalid", Fernet.generate_key().decode()):
             with (
-                self.subTest(key_length=len(value)),
+                self.subTest(value=value),
                 patch.dict(os.environ, {"COLLAB_KEY": value}),
-                patch("socket.socket") as factory,
             ):
-                with self.assertRaises((ValueError, RuntimeError)):
-                    Client("alice")
-                with self.assertRaises((ValueError, RuntimeError)):
-                    Server()
-                factory.assert_not_called()
+                client = Client("alice")
+                self.assertEqual(client.status, "disconnected")
+                client.close()
+                server = Server()
+                self.assertFalse(server.users)
+                server.close()
 
 
 class PathTests(unittest.TestCase):
@@ -428,33 +423,16 @@ class SecurityNetworkTests(unittest.TestCase):
         self.assertEqual(self.server.users, {})
         self.assertEqual(self.server.status, "running")
 
-    def test_replayed_login_fails_fresh_server_challenge(self):
-        nonce = "a" * 64
-        login_raw = None
-        for attempt in range(2):
-            with socket.create_connection(
-                ("127.0.0.1", self.server.tcp_port), timeout=1
-            ) as sock:
-                channel = Channel(self.server.f, ZERO_CONTEXT, ordered=True)
-                send_tcp(sock, dict(type="hello", client_nonce=nonce), security=channel)
-                reader = TCPReader(sock, channel)
-                challenge = reader.read()
-                if attempt == 0:
-                    login_raw = frame_tcp(
-                        dict(
-                            type="login",
-                            name="alice",
-                            client_nonce=nonce,
-                            server_nonce=challenge["server_nonce"],
-                        ),
-                        channel,
-                    )
-                    sock.sendall(login_raw)
-                    self.assertEqual(reader.read()["type"], "welcome")
-                else:
-                    sock.sendall(login_raw)
-                    self.assertEqual(sock.recv(1), b"")
-            wait(self, lambda: not self.server.users and not self.server.connections)
+    def test_old_tcp_envelope_fails_fresh_authenticated_session(self):
+        client = self.client("alice")
+        old = frame_tcp({"type": "users"}, client._session["tcp_security"])
+        client.close()
+        wait(self, lambda: not self.server.users)
+        client.connect()
+        with client._session["tcp_send_lock"]:
+            client.tcp.sendall(old)
+        wait(self, lambda: client.status == "disconnected")
+        wait(self, lambda: not self.server.users and not self.server.connections)
 
     def test_duplicate_tcp_control_closes_only_corresponding_session(self):
         a, b = self.client("alice"), self.client("bob")
@@ -477,8 +455,7 @@ class SecurityNetworkTests(unittest.TestCase):
         client.send_raw({"type": "heartbeat"})
         wait(
             self,
-            lambda: client._session["udp_security"].highest
-            > unseal(raw, self.server.f)[2],
+            lambda: client._session["udp_security"].highest > unseal(raw, client.f)[2],
         )
         self.assertEqual(client.names, ["alice"])
         self.assertLess(client.presence_revision, 1_000_000)
@@ -524,10 +501,8 @@ class SecurityNetworkTests(unittest.TestCase):
 
     def test_handshake_message_after_login_closes_only_that_session(self):
         healthy = self.client("healthy")
-        with socket.create_connection(
-            ("127.0.0.1", self.server.tcp_port), timeout=1
-        ) as sock:
-            _, reader = client_login(
+        with tls_connection(("127.0.0.1", self.server.tcp_port), timeout=1) as sock:
+            _, reader = fixture_login(
                 sock, "invalid_phase", self.server.f, time.monotonic() + 1
             )
             send_tcp(
@@ -561,7 +536,7 @@ class SecurityNetworkTests(unittest.TestCase):
         self.assertEqual(user["last_seen"], before)
         self.assertEqual(client.status, "connected")
 
-    def test_connection_with_wrong_key_rolls_back_resources(self):
+    def test_connection_with_wrong_password_rolls_back_resources(self):
         client = Client(
             "wrong",
             port=self.server.tcp_port,
@@ -569,8 +544,8 @@ class SecurityNetworkTests(unittest.TestCase):
         )
         self.clients.append(client)
         client.f = Fernet(Fernet.generate_key())
-        with self.assertRaises((ValueError, ConnectionError, OSError)):
-            client.connect()
+        with self.assertRaisesRegex(RuntimeError, "Invalid username or password"):
+            client.connect("wrong password")
         self.assertEqual(client.status, "disconnected")
         self.assertIsNone(client.token)
         self.assertIsNone(client.tcp)
@@ -578,24 +553,18 @@ class SecurityNetworkTests(unittest.TestCase):
         self.assertFalse(any(t.is_alive() for t in client.threads))
         wait(self, lambda: not self.server.connections and not self.server.users)
 
-    def test_stale_welcome_cannot_complete_new_handshake(self):
-        # A scripted peer returns a validly encrypted but transcript-mismatched reply.
-        stream = LoginStream(
-            [frame(dict(type="welcome", token="a" * 32, udp_port=9001))]
+    def test_welcome_without_session_key_cannot_complete_handshake(self):
+        stream = Stream(
+            [
+                frame(
+                    dict(
+                        type="welcome", token="a" * 32, udp_port=9001, session="b" * 32
+                    )
+                )
+            ]
         )
-        original = stream.sendall
-
-        def send(raw):
-            original(raw)
-            if not stream.in_handshake and stream.parts:
-                record = unseal(stream.parts[0][4:], self.server.f)
-                message = dict(record[3], client_nonce="0" * 64)
-                token = seal(message, self.server.f, ZERO_CONTEXT, S2C, 2, transport=1)
-                stream.parts = [struct.pack("!I", len(token)) + token]
-
-        stream.sendall = send
-        with self.assertRaisesRegex(ValueError, "nonce mismatch"):
-            client_login(stream, "alice", self.server.f, time.monotonic() + 1)
+        with self.assertRaises(ValueError):
+            client_login(stream, "alice", PASSWORD, time.monotonic() + 1)
 
 
 if __name__ == "__main__":

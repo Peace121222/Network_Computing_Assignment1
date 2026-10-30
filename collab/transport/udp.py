@@ -1,4 +1,4 @@
-"""Shared-key encrypted UDP encoding and datagram size checks."""
+"""Session-key encrypted UDP encoding and datagram size checks."""
 
 from __future__ import annotations
 from typing import Any
@@ -36,12 +36,16 @@ def cipher() -> Fernet:
 def udp_frame_size(msg: dict[str, Any]) -> int:
     """Exact Fernet ciphertext length without encrypting under registry locks."""
     size = len(json.dumps(msg, separators=(",", ":")).encode())
-    return encrypted_size(size)
+    return 32 + encrypted_size(size)
 
 
 def encode_udp(msg: Any, f: Fernet, security: Channel | None = None) -> bytes:
     _require(isinstance(msg, dict), "UDP message must be a JSON object")
-    raw = security.encode(msg) if security is not None else seal(msg, f)
+    raw = (
+        (security.context.encode("ascii") + security.encode(msg))
+        if security is not None
+        else seal(msg, f)
+    )
     _require(
         len(raw) <= UDP_MTU,
         "Encrypted UDP frame exceeds 1100 bytes; shorten the message or metadata",

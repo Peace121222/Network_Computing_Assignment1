@@ -30,7 +30,7 @@ from collab.shared.limits import (
     SESSION_TIMEOUT,
     UDP_MTU,
 )
-from collab.transport.udp import cipher, encode_udp
+from collab.transport.udp import encode_udp
 from collab.transport.tcp import send_tcp
 from collab.shared.protocol import validate_tcp, validate_udp, data_packet
 from collab.client.chat_inbox import ChatInbox
@@ -43,6 +43,9 @@ from collab.shared.limits import (
 )
 from collab.transport.tcp import write_tcp
 from collab.transport.handshake import client_login
+from collab.transport.tls import client_context
+from collab.accounts import validate_credentials
+from collab.transport.tcp import send_tcp, TCPReader
 from collab.transport.security import Channel, unseal
 from collab.shared.resilience import Cleanup, RetryDelay, SendBackoff, retryable
 
@@ -67,6 +70,8 @@ class Client:
         port: int = 9000,
         download_dir: str | Path = "downloads",
         *,
+        cafile: str | None = None,
+        server_name: str | None = None,
         file_idle_timeout: float = FILE_IDLE_TIMEOUT,
         file_transfer_timeout: float = FILE_TRANSFER_TIMEOUT,
     ) -> None:
@@ -83,7 +88,8 @@ class Client:
             file_transfer_timeout,
         )
         self.name, self.host, self.port = name, host, port
-        self.f = cipher()
+        self.f = None
+        self.cafile, self.server_name = cafile, server_name or host
         self._udp_backoff = SendBackoff(log)
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
@@ -119,7 +125,31 @@ class Client:
                 event["reason"] = reason
             self.events.put(event)
 
-    def connect(self) -> None:
+    def _open_tls(self, deadline=None):
+        context = client_context(self.cafile)
+        raw = socket.create_connection((self.host, self.port), timeout=CONNECT_TIMEOUT)
+        try:
+            if deadline is not None:
+                raw.settimeout(max(0.001, deadline - time.monotonic()))
+            return context.wrap_socket(raw, server_hostname=self.server_name)
+        except BaseException:
+            raw.close()
+            raise
+
+    def register(self, password, confirmation):
+        validate_credentials(self.name, password)
+        if password != confirmation:
+            raise ValueError("Passwords do not match")
+        deadline = time.monotonic() + CLIENT_LOGIN_TIMEOUT
+        with self._open_tls(deadline) as sock:
+            send_tcp(
+                sock, dict(type="register", name=self.name, password=password), deadline
+            )
+            response = TCPReader(sock).read(deadline)
+            if response.get("type") != "registered":
+                raise RuntimeError(response.get("message", "Registration failed"))
+
+    def connect(self, password=None) -> None:
         if not self._lifecycle_lock.acquire(blocking=False):
             raise RuntimeError("Client is already connecting or closing")
         try:
@@ -128,7 +158,7 @@ class Client:
             self._join_workers()
             if any(t.is_alive() for t in self.threads):
                 raise RuntimeError("Previous client workers are still closing")
-            validate_tcp({"type": "login", "name": self.name}, from_client=True)
+            validate_credentials(self.name, password)
             self._reset_session(clear_events=True)
             self._udp_backoff.reset()
             self._set_status("connecting")
@@ -142,12 +172,11 @@ class Client:
             }
             self._session = session
             try:
-                self.tcp = socket.create_connection(
-                    (self.host, self.port), timeout=CONNECT_TIMEOUT
-                )
-                session["tcp"] = self.tcp
                 deadline = time.monotonic() + CLIENT_LOGIN_TIMEOUT
-                hello, reader = client_login(self.tcp, self.name, self.f, deadline)
+                self.tcp = self._open_tls(deadline)
+                session["tcp"] = self.tcp
+                hello, reader = client_login(self.tcp, self.name, password, deadline)
+                self.f = reader.security.f
                 session["tcp_security"] = reader.security
                 session["udp_security"] = Channel(self.f, hello["session"])
                 self.token = hello["token"]
@@ -200,6 +229,7 @@ class Client:
 
     def _reset_session(self, *, clear_events=False):
         self.token = None
+        self.f = None
         self.address = None
         self.names = []
         self.presence_revision = -1

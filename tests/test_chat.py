@@ -15,10 +15,10 @@ from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
 from collab.client.chat_inbox import ChatInbox
-from collab.client import Client
+from tests.auth_support import Client
 from collab.common import encode_udp, decode_udp, validate_tcp, validate_udp
 from collab.transport.security import Channel
-from collab.server import Server
+from tests.auth_support import Server
 
 
 def incoming(seq=1, mid=None, sender="alice", epoch="a" * 32, channel="bob"):
@@ -137,8 +137,8 @@ class InboxTests(unittest.TestCase):
 
         cipher = Fernet(Fernet.generate_key())
         for count in range(100):
-            msg = {"text": "ế" * count}
-            actual = encode_udp(msg, cipher)
+            msg = {"text": "界" * count}
+            actual = encode_udp(msg, cipher, Channel(cipher, "a" * 32))
             self.assertEqual(udp_frame_size(msg), len(actual))
 
     def test_invalid_forwarded_chat_metadata_is_rejected(self):

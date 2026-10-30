@@ -17,6 +17,9 @@ env/
 
 # Files received while running the application
 /downloads/
+/certs/
+*.sqlite3
+*.sqlite3-*
 
 # Test coverage and build output
 .coverage

@@ -1,133 +1,116 @@
 # Collab LAN — Assignment 1
 
-A self-hosted LAN collaboration application built with Python TCP/UDP sockets and the `cryptography` library. It supports nickname login, online user lists, private and broadcast messaging, file transfers up to 25 MiB with SHA-256 verification, encrypted TCP/UDP traffic, and an HTTP interface using plain client-side JavaScript.
+A raw TCP/UDP socket collaboration application with persistent username/password accounts, online presence, private and broadcast chat, reliable file transfer with SHA-256 verification, and a local HTTP interface using client-side JavaScript.
 
-## 1. Requirements
+## 1. Requirements and installation
 
-- Python **3.10 or later**. The test suite has been verified on macOS with Python 3.12; Windows and Linux have not been verified directly.
-- All server/client processes must use the **same source-code version** and the same `COLLAB_KEY`.
-- Machines must be able to communicate over both TCP and UDP. Each browser accesses the HTTP backend on the machine running its client.
-- Node.js is optional for one test that executes the interface's JavaScript. The application does not require Node.js to run.
+Python **3.10+**; all clients and the server must run this same protocol version. The previous nickname/shared `COLLAB_KEY` login is incompatible and cannot authenticate to this server. `COLLAB_KEY` is ignored by the application entry points. Node.js is optional for one JavaScript test.
 
-Run the commands below from the project root directory.
-
-## 2. Installation and Key Generation
-
-Create a virtual environment:
+Run all commands from this repository:
 
 ```bash
-python -m venv .venv
-```
-
-Activate it on macOS/Linux:
-
-```bash
+python3 -m venv .venv
 source .venv/bin/activate
-```
-
-Or on Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-Install the dependency and generate a key:
-
-```bash
 python -m pip install -r requirements.txt
-python -m collab.keygen
 ```
 
-The last command prints a Fernet key. Copy this key for use by the server and every client; do not generate a different key for each terminal.
+On Windows, activate with `.venv\Scripts\Activate.ps1`. New runtime dependency: `argon2-cffi`; TLS/SQLite use Python’s standard library, and certificate/session encryption uses `cryptography`.
 
-In **every terminal**, activate the virtual environment and set the key before starting the application.
+## 2. Create and trust a local demo CA
 
-macOS/Linux:
+For localhost:
 
 ```bash
-export COLLAB_KEY='PASTE_GENERATED_KEY'
+python -m collab.certgen --out certs --names localhost 127.0.0.1
 ```
 
-Windows PowerShell:
+This creates `ca.crt`, `ca.key`, `server.crt`, `server.key`. Keep both private keys on the server and protect them; the generator creates them with mode 0600. It refuses to overwrite files. Certificates expire after 90 days (CA: 365 days); generate a new directory when rotating and distribute the new CA through a trusted channel.
 
-```powershell
-$env:COLLAB_KEY='PASTE_GENERATED_KEY'
-```
-
-Missing or malformed keys are rejected before opening a connection. Changing the key requires restarting the server and clients.
-
-## 3. Running on Localhost with Three Terminals
-
-After configuring the environment and key in all three terminals:
-
-**Terminal 1 — server:**
+Clients explicitly trust **only the public `ca.crt`** using `--ca`. Verify its fingerprint over a separate trusted channel before copying it to another machine:
 
 ```bash
-python -m collab.server --host 127.0.0.1 --tcp-port 9000 --udp-port 9001
+openssl x509 -in certs/ca.crt -noout -sha256 -fingerprint
 ```
 
-**Terminal 2 — Alice:**
+No verification bypass is provided. The connection hostname/IP must occur in the certificate SAN. `--server-name localhost` can select the verified DNS identity independently of `--host`; it still requires a trusted matching certificate.
+
+## 3. Localhost demo: one server, two CLI users
+
+Activate the virtual environment in every terminal. Terminal 1:
 
 ```bash
-python -m collab.webui --name alice --host 127.0.0.1 --port 9000 --web-port 8080 --downloads downloads/alice
+python -m collab.server --host 127.0.0.1 --tcp-port 9000 --udp-port 9001 --cert certs/server.crt --key certs/server.key --database accounts.sqlite3
 ```
 
-**Terminal 3 — Bob:**
+Terminal 2:
 
 ```bash
-python -m collab.webui --name bob --host 127.0.0.1 --port 9000 --web-port 8081 --downloads downloads/bob
+python -m collab.client --name alice --host 127.0.0.1 --port 9000 --ca certs/ca.crt --downloads downloads/alice
 ```
 
-Open two browser tabs:
-
-- Alice: <http://127.0.0.1:8080>
-- Bob: <http://127.0.0.1:8081>
-
-Select a nickname to send a private message or `Everyone` to broadcast. The interface displays messages, online users, connection status, and separate progress bars for each outgoing/incoming file. Received files are saved in the `--downloads` directory with a random prefix to prevent overwrites. A file is reported as received only after its hash has been verified and the file has been saved successfully.
-
-You can use `python -m collab.web` instead of `python -m collab.webui` with the same arguments. Press Ctrl+C in the relevant terminal to stop a backend/client or the server. Closing a browser tab does not stop the client process.
-
-## 4. Running the Command-Line Client
-
-In a terminal with the virtual environment activated and the same key configured:
+Terminal 3:
 
 ```bash
-python -m collab.client --name carol --host 127.0.0.1 --port 9000 --downloads downloads/carol
+python -m collab.client --name bob --host 127.0.0.1 --port 9000 --ca certs/ca.crt --downloads downloads/bob
 ```
 
-Enter these commands in the client:
+In each client terminal choose **2. Register**, press Enter to accept the prefilled username, enter a password and confirm it (both hidden via `getpass`). After successful registration the menu returns; choose **1. Log in**, accept the username and enter the password. Choose **3. Exit** to exit. `--name` is optional and never bypasses authentication. Passwords have no command-line option.
+
+Usernames contain 1–24 Unicode letters/digits/underscores with at least one letter/digit, following the existing validator. They are **case-sensitive** (`Alice` and `alice` differ) and remain reserved offline. Passwords must be 8–128 characters. Incorrect login uses a generic message; the server reports an existing active session only after verifying the password. One account has one active session.
+
+After login:
 
 ```text
 /users
-/msg alice Hello Alice
+/msg bob Hello Bob
 /all Hello everyone
-/file alice ./sample.bin
+/file bob /absolute/path/to/file.bin
 /quit
 ```
 
-File paths are relative to the client process's working directory. Nicknames contain 1–24 letters, digits, or underscores, with at least one letter or digit. They are case-sensitive and must not duplicate an active session's nickname. The client reports individual command errors and continues while its connection remains healthy. Use `/quit`, EOF, or Ctrl+C to exit.
+Paths are relative to the client working directory unless absolute. Received files use random prefixes in `--downloads`; files are announced complete only after hash verification and saving. `/quit`, EOF, Ctrl+C, TCP loss and heartbeat expiry terminate the session. There is no automatic reconnect. Restart the same server with the same `--database` to retain accounts; start a client again to log in with a new key.
 
-## 5. Running Across LAN Machines
+## 4. Two Web UI backends
 
-On the server machine:
-
-```bash
-python -m collab.server --host 0.0.0.0 --tcp-port 9000 --udp-port 9001
-```
-
-On each client machine, replace `SERVER_LAN_IP` with the server's actual LAN IP address:
+Stop the corresponding CLI sessions first (one session per account). Terminal 2:
 
 ```bash
-python -m collab.webui --name alice --host SERVER_LAN_IP --port 9000 --web-port 8080 --downloads downloads/alice
+python -m collab.webui --name alice --host 127.0.0.1 --port 9000 --ca certs/ca.crt --web-port 8080 --downloads downloads/alice
 ```
 
-Open <http://127.0.0.1:8080> on **that client machine**. When running multiple clients on one machine, use distinct nicknames and `--web-port` values. Allow TCP 9000 and UDP 9001 through the server machine's firewall. Bidirectional UDP communication is required for endpoint registration, data reception, and ACKs.
+Terminal 3:
 
-The HTTP backend binds only to `127.0.0.1`; its port does not need to be exposed to the LAN. Automated tests use localhost and do not replace checks of firewall configuration and connectivity between physical machines.
+```bash
+python -m collab.webui --name bob --host 127.0.0.1 --port 9000 --ca certs/ca.crt --web-port 8081 --downloads downloads/bob
+```
+
+Complete the same terminal login menu. Only after authentication succeeds does the backend open its local HTTP listener and print [Alice’s UI](http://127.0.0.1:8080) or [Bob’s UI](http://127.0.0.1:8081). No browser login form is added. `python -m collab.web` is an equivalent entry point. Browser tabs do not own the session; Ctrl+C in the backend terminal logs out. HTTP remains bound to `127.0.0.1` and should be opened on the client machine.
+
+## 5. LAN configuration
+
+Suppose the server’s LAN IP is `192.168.1.10`. Generate certificates containing that actual IP (use a new directory):
+
+```bash
+python -m collab.certgen --out certs-lan --names localhost 127.0.0.1 192.168.1.10
+python -m collab.server --host 0.0.0.0 --tcp-port 9000 --udp-port 9001 --cert certs-lan/server.crt --key certs-lan/server.key --database accounts.sqlite3
+```
+
+Copy `certs-lan/ca.crt` securely to each client, for example as `certs/ca.crt`, and compare fingerprints. On each client:
+
+```bash
+python -m collab.client --name alice --host 192.168.1.10 --port 9000 --ca certs/ca.crt --downloads downloads/alice
+# On the other client, change alice to bob and downloads/alice to downloads/bob.
+```
+
+For the Web UI use the commands from section 4 with `--host 192.168.1.10`. Open the printed localhost URL on each client’s own machine. Allow inbound TCP 9000 and UDP 9001 on the server and bidirectional UDP for clients. A changed IP requires a matching new certificate SAN. `--database` and `--downloads` are relative to the process working directory unless absolute; the database parent directory must already exist.
+
+The Assignment 1 PDF requires login/state tracking, raw sockets, UDP file transfer, separation of UI/network logic and standard cryptographic libraries. This implementation uses `socket`/`ssl` and retains the custom UDP reliability protocol; it adds no Flask/Django/WebSockets. The PDF also mentions BBR/CUBIC, which this project does not implement; no claim of full rubric compliance is made. The existing generated report under `docs/` predates this authentication change; this README describes the current protocol.
+
+Detailed exchange and behavioral test coverage: [authentication protocol](docs/authentication.md).
 
 ## 6. Protocol and Delivery Semantics
 
-- **TCP:** the `hello → challenge → login → welcome/error` handshake, session management, large online-user snapshots, chat/file results, and control messages. Each frame contains a 4-byte length header and a Fernet-encrypted body.
+- **TCP:** TLS followed by `login → welcome/error` (or `register → registered/error`), session management, large online-user snapshots, chat/file results, and control messages. Each frame has a 4-byte length header. Authentication frames are JSON inside TLS; established frames also carry a Fernet session envelope.
 - **UDP:** heartbeats, endpoint verification through challenge/response, presence, ACKs, and chat/file data. Encrypted datagrams are limited to **1,100 bytes**; file chunks contain **320 bytes**.
 - Security envelopes bind the protocol version, session, direction, TCP/UDP channel, and sequence number. TCP requires the exact next sequence number; UDP uses a **4,096-packet** replay window. Retries retain their application-level ID and receive a new security sequence number.
 - Heartbeats are sent every **2 seconds**. After **10 seconds without valid application UDP traffic from a verified endpoint**, the server closes the session even if TCP is still open. Expiry is checked every 0.5 seconds. Losing TCP also ends the session.
@@ -144,7 +127,9 @@ The HTTP backend binds only to `127.0.0.1`; its port does not need to be exposed
 - HTTP uses 2 send workers and 4 waiting slots, allows up to 2 uploads, and has 8 handler workers with capacity for 16 admitted connections. Exhausted task capacity returns HTTP 503.
 - Chat is limited by both character count and ciphertext size; not every 1,000-character message fits in one datagram. Long messages are not fragmented.
 - Reliability includes ACKs/retries, a send window, and chat ordering with a maximum 1-second gap wait per stream. **BBR/CUBIC is not implemented.** File resume, offline message storage, and automatic retransmission of an entire file are also not implemented. Chunks arriving before `file_start` are neither accepted nor ACKed.
-- Fernet protects both TCP and UDP using a **shared group key**. Anyone who knows that key can decrypt and forge group traffic. Login authenticates nicknames/sessions within a trusted group; there are no passwords, database, TLS, per-user keys, or end-to-end encryption between clients.
+- TLS verifies the server and protects the entire TCP connection. Every successful login receives a fresh random Fernet key, session ID and token over TLS. UDP includes a 32-byte public session lookup prefix; the encrypted envelope independently authenticates that context. The server decrypts Alice’s traffic and encrypts it under Bob’s key: **this is not end-to-end encryption**. Keys are never stored in SQLite or printed. Session references are released when sockets/workers finish; Python does not guarantee secure memory erasure.
+- Passwords use Argon2id (19 MiB memory, 2 iterations, parallelism 1, random library-managed salts). Policy: 8–128 characters, no composition rule, no silent trimming. Use a unique passphrase. SQLite stores only id, case-sensitive unique username, password_hash and creation time. Protect the database and CA/server private keys with filesystem permissions; SQLite is not encrypted at rest.
+- Authentication attempts (including registrations and successful attempts) are limited per source IP to 10 per 60-second window, with at most 4,096 remembered IPs. This is temporary and may affect users behind one NAT; it is not a distributed abuse defense. Unauthenticated sockets share the 64-connection cap and handshake deadline, accept at most 2,048 bytes per authentication frame, and share four Argon2 workers (about 76 MiB hashing memory). No email, password reset, OAuth or admin roles are provided.
 - The replay window rejects previously observed packets and packets outside its window. It cannot identify every valid packet withheld before its first delivery.
 - The interface serves one local user. There is no persistent history or event synchronization across multiple tabs; refreshing does not restore history already consumed from the backend.
 
@@ -156,9 +141,9 @@ Run the complete suite from the project root:
 python -m unittest discover -s tests -v
 ```
 
-The suite currently contains **237 tests** covering protocol validation, handshake deadlines and rollback, sessions/presence, 20 concurrent clients, chat retries and ordering, files/hashes/disk failures, worker failures and cleanup, security/replay/UDP endpoint verification, the HTTP interface, CLI compatibility, static-resource loading, and public annotation contracts.
+The unittest suite covers protocol validation, handshake deadlines and rollback, sessions/presence, 20 concurrent clients, chat retries and ordering, files/hashes/disk failures, worker failures and cleanup, security/replay/UDP endpoint verification, the HTTP interface, CLI compatibility, static-resource loading, and public annotation contracts.
 
-Tests generate temporary keys, open localhost sockets on operating-system-assigned ports, and use temporary directories. One JavaScript test uses Node.js when it is available in `PATH`; otherwise, that test is skipped. Tests that intentionally simulate failures may print traceback logs even when the final result is `OK`; check the summary and exit code.
+Tests generate temporary accounts, databases, CA certificates and session keys, open localhost sockets on operating-system-assigned ports, and use temporary directories. One JavaScript test uses Node.js when it is available in `PATH`; otherwise, that test is skipped. Tests that intentionally simulate failures may print traceback logs even when the final result is `OK`; check the summary and exit code.
 
 Run the integration or interface tests separately:
 
@@ -195,7 +180,8 @@ collab/
   web/          # HTTP handlers, bounded runtime, and CLI
     static/     # index.html, style.css, and app.js
   common.py     # Compatibility imports for protocol/transport
-  keygen.py     # Fernet key generation
+  accounts.py   # SQLite accounts, Argon2id and bounded throttling
+  certgen.py    # Local demo CA and server certificate generation
   webui.py      # Compatibility entry point for the web interface
 tests/          # Automated test suite
 docs/           # Existing PDF report and report-generation script
@@ -203,7 +189,7 @@ docs/           # Existing PDF report and report-generation script
 
 The client terminal interface lives in `collab.client.cli`; `collab.client.core.main()` remains a lazy forwarding entry point. Web handlers retain the `PAGE` HTML export, while CSS and JavaScript are served from a fixed static-resource allowlist. Static files are resolved relative to the package, so loading does not depend on the current working directory. Include the entire `collab/web/static/` directory when copying the project.
 
-Public protocol/transport and client/server interfaces have type annotations compatible with Python 3.10+. Validators still accept untrusted values and return the validated message; annotations do not replace runtime validation. Lock documentation identifies caller-held locks, session checks, and cleanup ownership without changing the synchronization model.
+Python 3.10+ remains the minimum supported version. Validators still accept untrusted values and return the validated message; annotations do not replace runtime validation. Lock documentation identifies caller-held locks, session checks, and cleanup ownership without changing the synchronization model.
 
 Shared timing defaults are centralized in `collab/shared/limits.py`:
 

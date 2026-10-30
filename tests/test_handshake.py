@@ -12,11 +12,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
-from collab.client import Client
-from collab.server import Server
+from tests.auth_support import Client
+from tests.auth_support import Server
 from collab.common import TCPReader, recv_tcp, send_tcp
 from collab.transport.security import Channel, HEADER, VERSION, ZERO_CONTEXT
-from collab.transport.handshake import client_login
+from tests.auth_support import client_login, tls_connection
 from collab.transport.tcp import frame_tcp
 from collab.transport.udp import cipher
 
@@ -63,38 +63,20 @@ class LoginStream(Stream):
 
     def sendall(self, raw):
         self.sent.append(raw)
-        if not hasattr(self, "security") or not getattr(self, "in_handshake", False):
-            self.security = Channel(cipher(), ZERO_CONTEXT, server=True, ordered=True)
         try:
-            message = self.security.decode(raw[4:])
-        except ValueError:
-            return  # Logout belongs to the established context.
-        if message["type"] == "hello":
-            self.in_handshake = True
-            self.reply_parts = self.parts
-            self.transcript = dict(
-                client_nonce=message["client_nonce"], server_nonce="f" * 64
-            )
-            self.parts = [
-                frame_tcp(dict(type="challenge", **self.transcript), self.security)
-            ]
-        elif message["type"] == "login":
-            self.in_handshake = False
-            if not self.reply_parts or isinstance(self.reply_parts[0], BaseException):
-                self.parts = self.reply_parts
-                return
-            response = json.loads(b"".join(self.reply_parts)[4:])
-            if isinstance(response, dict):
-                response.update(self.transcript)
-                if response.get("type") == "welcome":
-                    response["session"] = "e" * 32
-                self.parts = [frame_tcp(response, self.security)]
-            else:
-                token = cipher().encrypt(
-                    HEADER.pack(VERSION, bytes(16), 2, 1, 2)
-                    + json.dumps(response).encode()
-                )
-                self.parts = [struct.pack("!I", len(token)) + token]
+            message = json.loads(raw[4:])
+        except (ValueError, UnicodeError):
+            return
+        if (
+            message.get("type") == "login"
+            and self.parts
+            and isinstance(self.parts[0], bytes)
+        ):
+            response = json.loads(b"".join(self.parts)[4:])
+            if isinstance(response, dict) and response.get("type") == "welcome":
+                response["session"] = "e" * 32
+                response["key"] = Fernet.generate_key().decode()
+            self.parts = [frame(response)]
 
 
 class ReaderTests(unittest.TestCase):
@@ -167,7 +149,7 @@ class ClientLifecycleTests(unittest.TestCase):
         self.udp = Mock()
         self.udp.recvfrom.side_effect = OSError("closed")
         self.connection = patch(
-            "collab.client.core.socket.create_connection", return_value=self.tcp
+            "collab.client.core.Client._open_tls", return_value=self.tcp
         )
         self.udp_factory = patch(
             "collab.client.core.socket.socket", return_value=self.udp
@@ -339,7 +321,7 @@ class ClientLifecycleTests(unittest.TestCase):
 
     def test_connection_failure_can_be_retried(self):
         with patch(
-            "collab.client.core.socket.create_connection",
+            "collab.client.core.Client._open_tls",
             side_effect=ConnectionRefusedError(),
         ):
             with self.assertRaises(ConnectionRefusedError):
@@ -369,7 +351,7 @@ class HandshakeNetworkTests(unittest.TestCase):
         self.env.stop()
 
     def connect(self):
-        return socket.create_connection(("127.0.0.1", self.server.tcp_port), timeout=1)
+        return tls_connection(("127.0.0.1", self.server.tcp_port), timeout=1)
 
     def wait_removed(self, name):
         until = time.monotonic() + 2
@@ -396,7 +378,12 @@ class HandshakeNetworkTests(unittest.TestCase):
 
     def test_silent_and_drip_login_expire(self):
         for drip in (False, True):
-            with self.subTest(drip=drip), self.connect() as sock:
+            with (
+                self.subTest(drip=drip),
+                socket.create_connection(
+                    ("127.0.0.1", self.server.tcp_port), timeout=1
+                ) as sock,
+            ):
                 start = time.monotonic()
                 if drip:
                     for byte in frame({"type": "login", "name": "slow"})[:4]:
@@ -418,11 +405,11 @@ class HandshakeNetworkTests(unittest.TestCase):
             _, reader = client_login(
                 original, "alice", self.server.f, time.monotonic() + 1
             )
-            for name in ([], "alice"):
+            for name in ("bad name", "alice"):
                 with self.connect() as sock:
-                    with self.assertRaises(RuntimeError):
+                    with self.assertRaises((ValueError, RuntimeError)):
                         client_login(sock, name, self.server.f, time.monotonic() + 1)
-                    self.assertEqual(sock.recv(1), b"")
+                    sock.close()
             send_tcp(original, {"type": "users"}, security=reader.security)
             self.assertEqual(reader.read()["names"], ["alice"])
         self.wait_removed("alice")

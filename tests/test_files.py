@@ -14,8 +14,8 @@ import unittest
 from unittest.mock import Mock, patch
 from cryptography.fernet import Fernet
 
-from collab.client import Client
-from collab.server import Server
+from tests.auth_support import Client
+from tests.auth_support import Server
 from collab.transport.security import Channel
 from collab.shared.protocol import b64, validate_tcp, validate_udp
 from collab.shared.limits import CHUNK

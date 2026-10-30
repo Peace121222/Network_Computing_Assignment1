@@ -1,7 +1,4 @@
-"""Authenticated envelopes and bounded replay state for the shared-key protocol.
-
-Possession of the group key grants group-wide trust, not individual identity.
-"""
+"""Session-bound authenticated envelopes with directional replay protection."""
 
 from __future__ import annotations
 from typing import Any
@@ -45,6 +42,8 @@ def seal(
 
 def unseal(raw: bytes, f: Fernet) -> tuple[str, int, int, dict[str, Any], int]:
     try:
+        if len(raw) >= 32 and all(byte in b"0123456789abcdef" for byte in raw[:32]):
+            raw = raw[32:]
         plain = f.decrypt(raw)
         version, context, direction, transport, sequence = HEADER.unpack(
             plain[: HEADER.size]

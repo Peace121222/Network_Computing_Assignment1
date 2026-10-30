@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-from collab.client.core import Client
+from collab.client.terminal_auth import authenticate
 from collab.shared.limits import SHUTDOWN_TIMEOUT
 
 log = logging.getLogger(__name__)
@@ -16,18 +16,21 @@ log = logging.getLogger(__name__)
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name", required=True)
+    parser.add_argument("--name")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--downloads", default="downloads")
+    parser.add_argument("--ca", required=True)
+    parser.add_argument("--server-name")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     client = None
     printer_thread = None
     result = 0
     try:
-        client = Client(args.name, args.host, args.port, args.downloads)
-        client.connect()
+        client = authenticate(args)
+        if client is None:
+            return 0
         print(
             "Commands: /users, /msg USER MESSAGE, /all MESSAGE, /file USER PATH, /quit"
         )

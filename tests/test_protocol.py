@@ -14,7 +14,7 @@ from unittest.mock import patch
 from cryptography.fernet import Fernet
 from collab import common
 from collab.transport.security import Channel
-from collab.client import Client
+from tests.auth_support import Client
 
 
 class BufferSocket:
@@ -141,7 +141,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(fits)
         self.assertEqual(min(too_large), max(fits) + 1)
         common.encode_udp(dict(self.packet, payload="a" * max(fits)), self.f)
-        for text in ("a" * 1000, "ế" * 500):
+        for text in ("a" * 1000, "界" * 500):
             with self.assertRaisesRegex(ValueError, "1100 bytes"):
                 common.encode_udp(dict(self.packet, payload=text), self.f)
 
@@ -193,7 +193,7 @@ class ProtocolTests(unittest.TestCase):
             meta={"transfer": "b" * 32, "index": 0},
         )
         common.validate_udp(chunk, from_client=True)
-        for payload in ("", "!!!!", common.b64(b"x" * (common.CHUNK + 1)), "ế"):
+        for payload in ("", "!!!!", common.b64(b"x" * (common.CHUNK + 1)), "界"):
             with self.subTest(payload=payload[:12]), self.assertRaises(ValueError):
                 common.validate_udp(dict(chunk, payload=payload), from_client=True)
         for index in (True, -1, common.MAX_CHUNKS, "0"):

@@ -10,11 +10,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
-from collab.client import Client
-from collab.server import Server
+from tests.auth_support import Client
+from tests.auth_support import Server
 from collab.common import encode_udp, send_tcp, recv_tcp, validate_tcp, validate_udp
 from collab.transport.security import Channel
-from collab.transport.handshake import client_login
+from tests.auth_support import client_login, tls_connection
 
 
 class SessionUnitTests(unittest.TestCase):
@@ -306,9 +306,7 @@ class SessionNetworkTests(unittest.TestCase):
 
     def test_login_without_udp_registration_expires(self):
         self.server.session_expiry = 0.2
-        with socket.create_connection(
-            ("127.0.0.1", self.server.tcp_port), timeout=1
-        ) as sock:
+        with tls_connection(("127.0.0.1", self.server.tcp_port), timeout=1) as sock:
             welcome, _ = client_login(
                 sock, "no_udp", self.server.f, time.monotonic() + 1
             )
@@ -403,7 +401,7 @@ class SessionNetworkTests(unittest.TestCase):
 
     def test_twenty_clients_and_oversized_snapshot_falls_back_to_tcp(self):
         # Unicode names maximize JSON expansion and exceed the UDP ciphertext limit.
-        names = ["ế" * 21 + str(i) for i in range(20)]
+        names = ["界" * 21 + str(i) for i in range(20)]
         clients = [self.client(name) for name in names]
         expected = sorted(names)
         self.wait(lambda: all(c.names == expected for c in clients), timeout=8)

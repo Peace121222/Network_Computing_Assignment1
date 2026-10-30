@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
-from collab.client import Client
+from tests.auth_support import Client
 from collab.web.handlers import BoundedHTTPServer, handler_factory
 
 

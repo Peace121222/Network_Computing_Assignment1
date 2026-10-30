@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from collab.client import Client
-from collab.server import Server
+from tests.auth_support import Client
+from tests.auth_support import Server
 from collab.shared.protocol import validate_udp
 from collab.transport.udp import encode_udp
 
@@ -163,7 +163,7 @@ class NetworkTests(unittest.TestCase):
         )
 
     def test_07_oversize_chat_fails_without_poisoning_sender(self):
-        for text in ("a" * 1000, "ế" * 500):
+        for text in ("a" * 1000, "界" * 500):
             with self.assertRaisesRegex(ValueError, "1100 bytes"):
                 self.a.chat("bob", text)
             self.assertEqual(self.a.pending, {})

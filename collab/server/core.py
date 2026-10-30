@@ -12,6 +12,11 @@ from collab.shared.limits import (
 )
 
 import argparse
+import ssl
+import sqlite3
+from cryptography.fernet import Fernet
+from collab.accounts import Accounts, AuthLimiter
+from collab.transport.tls import server_context
 import errno
 from functools import wraps
 import sys
@@ -32,7 +37,7 @@ from collab.shared.limits import (
     SESSION_EXPIRY,
     SESSION_CHECK_INTERVAL,
 )
-from collab.transport.udp import cipher, encode_udp
+from collab.transport.udp import encode_udp
 from collab.transport.tcp import send_tcp, frame_tcp
 from collab.transport.handshake import server_login
 from collab.transport.security import Channel, nonce, unseal
@@ -65,6 +70,9 @@ class Server:
         tcp_port: int = 9000,
         udp_port: int = 9001,
         *,
+        database: str = "accounts.sqlite3",
+        certfile: str | None = None,
+        keyfile: str | None = None,
         session_expiry: float = SESSION_EXPIRY,
         session_check_interval: float = SESSION_CHECK_INTERVAL,
         max_connections: int = 64,
@@ -101,7 +109,12 @@ class Server:
             file_idle_timeout,
             file_transfer_timeout,
         )
-        self.f = cipher()
+        self.database = database
+        self.accounts = None
+        self.auth_limiter = AuthLimiter()
+        self.tls_context = (
+            server_context(certfile, keyfile) if certfile and keyfile else None
+        )
         self._udp_backoff = SendBackoff(log)
         self.lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
@@ -227,6 +240,9 @@ class Server:
         try:
             if self.status != "stopped" or any(t.is_alive() for t in self.threads):
                 raise RuntimeError("Server is not stopped")
+            if self.tls_context is None:
+                raise ValueError("TLS certificate and private key are required")
+            self.accounts = Accounts(self.database)
             self.status = "starting"
             self._last_error = None
             self._run_id = object()
@@ -474,7 +490,12 @@ class Server:
                 raise TimeoutError("Control write timeout")
             try:
                 count = sock.send(frame)
-            except (BlockingIOError, InterruptedError):
+            except (
+                BlockingIOError,
+                InterruptedError,
+                ssl.SSLWantReadError,
+                ssl.SSLWantWriteError,
+            ):
                 continue
             if count == 0:
                 raise ConnectionError("Control socket closed")
@@ -626,13 +647,77 @@ class Server:
                     break
                 log.exception("Could not start connection handler")
 
+    def _authenticate_request(self, request, conn, deadline):
+        if request["type"] == "register":
+            try:
+                self.accounts.register(request["name"], request.pop("password"))
+                response = dict(type="registered")
+            except ValueError as exc:
+                response = dict(type="error", message=str(exc))
+            send_tcp(conn, response, deadline)
+            return
+        request["authenticated"] = self.accounts.verify(
+            request["name"], request.pop("password")
+        )
+        if not request["authenticated"]:
+            send_tcp(
+                conn,
+                dict(type="error", message="Invalid username or password"),
+                deadline,
+            )
+
     def handle_client(self, conn, deadline=None):
         name = token = None
         deadline = time.monotonic() + LOGIN_TIMEOUT if deadline is None else deadline
         try:
-            hello, reader, transcript = server_login(
-                conn, self.f, deadline, self.stopping
+            original = conn
+            conn.settimeout(max(0.001, deadline - time.monotonic()))
+            conn = self.tls_context.wrap_socket(
+                conn, server_side=True, do_handshake_on_connect=False
             )
+            with self.lock:
+                self.connections.discard(original)
+                self.connections.add(conn)
+            conn.setblocking(False)
+            while True:
+                if self.stopping.is_set() or time.monotonic() >= deadline:
+                    raise TimeoutError("TLS handshake deadline exceeded")
+                try:
+                    conn.do_handshake()
+                    break
+                except ssl.SSLWantReadError:
+                    select.select(
+                        [conn], [], [], min(0.1, max(0, deadline - time.monotonic()))
+                    )
+                except ssl.SSLWantWriteError:
+                    select.select(
+                        [], [conn], [], min(0.1, max(0, deadline - time.monotonic()))
+                    )
+            conn.settimeout(max(0.001, deadline - time.monotonic()))
+            if not self.auth_limiter.allow(conn.getpeername()[0]):
+                send_tcp(
+                    conn,
+                    dict(
+                        type="error",
+                        message="Too many authentication attempts; try later",
+                    ),
+                    deadline,
+                )
+                return
+            hello, reader = server_login(conn, deadline, self.stopping)
+            transcript = {}
+            if not self.accounts.slots.acquire(
+                timeout=max(0, deadline - time.monotonic())
+            ):
+                raise TimeoutError("Authentication capacity timeout")
+            try:
+                self._authenticate_request(hello, conn, deadline)
+            finally:
+                self.accounts.slots.release()
+            if hello["type"] == "register" or not hello.pop("authenticated", False):
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Authentication deadline exceeded")
             try:
                 validate_tcp(hello, from_client=True)
                 if hello["type"] != "login":
@@ -650,8 +735,10 @@ class Server:
                 duplicate = name in self.users
                 if not duplicate and self.running.is_set():
                     token = uuid.uuid4().hex
+                    session_key = Fernet.generate_key()
                     user = dict(
                         sock=conn,
+                        cipher=Fernet(session_key),
                         token=token,
                         tcp_addr=conn.getpeername(),
                         udp_addr=None,
@@ -685,15 +772,18 @@ class Server:
                     token=token,
                     udp_port=self.udp_port,
                     session=user["public_id"],
+                    key=session_key.decode(),
                     **transcript,
                 ),
                 deadline=deadline,
                 security=reader.security,
             )
             user["tcp_security"] = Channel(
-                self.f, user["public_id"], server=True, ordered=True
+                user["cipher"], user["public_id"], server=True, ordered=True
             )
-            user["udp_security"] = Channel(self.f, user["public_id"], server=True)
+            user["udp_security"] = Channel(
+                user["cipher"], user["public_id"], server=True
+            )
             reader.security = user["tcp_security"]
             conn.setblocking(False)
             reader.wait_timeout = SESSION_TIMEOUT
@@ -733,7 +823,7 @@ class Server:
                         snapshot = self._snapshot_locked("users")
                     if not self._send_control(user, snapshot):
                         break
-        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error) as exc:
             log.debug("TCP exit: %s", exc)
         finally:
             if token is not None:
@@ -762,7 +852,9 @@ class Server:
                 return False
             if not self._udp_backoff.ready():
                 return False
-            raw = encode_udp(message, self.f, destination["udp_security"])
+            raw = encode_udp(
+                message, destination["udp_security"].f, destination["udp_security"]
+            )
             try:
                 udp.sendto(raw, address)
             except OSError as exc:
@@ -796,10 +888,19 @@ class Server:
         if len(raw) > UDP_MTU:
             return
         try:
-            record = unseal(raw, self.f)
+            context = raw[:32].decode("ascii")
+            with self.lock:
+                candidates = [
+                    u["udp_security"].f
+                    for u in self.users.values()
+                    if u["public_id"] == context and u["ready"] and "udp_security" in u
+                ]
+            if not candidates:
+                return
+            record = unseal(raw, candidates[0])
             msg = record[3]
             validate_udp(msg, from_client=True)
-        except ValueError:
+        except (ValueError, UnicodeError):
             return
         name, token = msg["from"], msg["token"]
         challenge = None
@@ -891,12 +992,22 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--tcp-port", type=int, default=9000)
     parser.add_argument("--udp-port", type=int, default=9001)
+    parser.add_argument("--cert", required=True)
+    parser.add_argument("--key", required=True)
+    parser.add_argument("--database", default="accounts.sqlite3")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     server = None
     result = 0
     try:
-        server = Server(args.host, args.tcp_port, args.udp_port)
+        server = Server(
+            args.host,
+            args.tcp_port,
+            args.udp_port,
+            database=args.database,
+            certfile=args.cert,
+            keyfile=args.key,
+        )
         server.start()
         server.stopping.wait()
         if server.last_error is not None:

@@ -15,6 +15,17 @@ from collab.transport.security import encrypted_size, seal, unseal
 
 
 def get_key() -> bytes:
+    """Read and validate the legacy COLLAB_KEY environment variable.
+
+    Account-based client and server entry points do not use this helper for login.
+
+    Returns:
+        Canonically encoded 32-byte Fernet key material as URL-safe base64 bytes.
+
+    Raises:
+        RuntimeError: COLLAB_KEY is missing or empty.
+        ValueError: COLLAB_KEY is not a canonical Fernet key.
+    """
     key = os.getenv("COLLAB_KEY", "")
     if not key:
         raise RuntimeError("Set COLLAB_KEY (generate with python -m collab.keygen)")
@@ -30,16 +41,49 @@ def get_key() -> bytes:
 
 
 def cipher() -> Fernet:
+    """Construct a legacy Fernet cipher from COLLAB_KEY.
+
+    Returns:
+        A cipher using the key returned by get_key().
+
+    Raises:
+        RuntimeError: COLLAB_KEY is missing or empty.
+        ValueError: COLLAB_KEY is invalid.
+    """
     return Fernet(get_key())
 
 
 def udp_frame_size(msg: dict[str, Any]) -> int:
-    """Exact Fernet ciphertext length without encrypting under registry locks."""
+    """Calculate session-framed UDP size including the public lookup prefix.
+
+    No encryption is performed, so this estimate can be used during registry updates.
+    It includes 32 prefix bytes even when encode_udp() is later used without a channel.
+
+    Args:
+        msg: Message dictionary to encode as compact JSON.
+
+    Returns:
+        Datagram size in bytes for encoding with a session channel.
+    """
     size = len(json.dumps(msg, separators=(",", ":")).encode())
     return 32 + encrypted_size(size)
 
 
 def encode_udp(msg: Any, f: Fernet, security: Channel | None = None) -> bytes:
+    """Encode a message and enforce the encrypted datagram size limit.
+
+    Args:
+        msg: Message dictionary to encode.
+        f: Fernet cipher used only when security is None.
+        security: Optional session channel. When supplied, its public context prefix is
+            added and its outbound sequence advances; otherwise seal() is used directly.
+
+    Returns:
+        An encoded datagram of at most UDP_MTU bytes.
+
+    Raises:
+        ValueError: The message is not a dictionary or the datagram exceeds UDP_MTU.
+    """
     _require(isinstance(msg, dict), "UDP message must be a JSON object")
     raw = (
         (security.context.encode("ascii") + security.encode(msg))
@@ -56,9 +100,16 @@ def encode_udp(msg: Any, f: Fernet, security: Channel | None = None) -> bytes:
 def decode_udp(
     raw: bytes, f: Fernet, security: Channel | None = None
 ) -> dict[str, Any] | None:
-    """Inspect an envelope; pass a channel to enforce session and replay checks.
+    """Decode a UDP message, returning None for oversize or invalid frames.
 
-    Network receivers validate the message schema before committing replay state.
+    Args:
+        raw: Received datagram bytes.
+        f: Fernet cipher used only when security is None.
+        security: Optional channel that also validates and commits replay state.
+
+    Returns:
+        The decrypted dictionary, or None if decoding fails. Message schemas are not
+        checked. Without security, session binding and replay state are not enforced.
     """
     if len(raw) > UDP_MTU:
         return None

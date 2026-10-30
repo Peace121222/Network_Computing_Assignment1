@@ -12,12 +12,36 @@ from collab.shared.resilience import Cleanup
 
 
 class WebRuntime:
+    """Own the bounded send-job pool and upload capacity for one HTTP backend.
+
+    Attributes:
+        client: Client core shared by HTTP handlers and queued send jobs.
+        tasks: Executor started during runtime construction.
+        uploads: Semaphore limiting concurrent upload processing.
+    """
+
     def __init__(self, client):
         self.client = client
         self.tasks = BoundedExecutor(2, 4, name="collab-send")
         self.uploads = threading.BoundedSemaphore(2)
 
     def submit(self, lease, session, fn, args, cleanup):
+        """Submit work bound to the captured client session and transfer its cleanup.
+
+        Background failures become client error events. The task's cleanup remains owned
+        by the executor after submission, including cancellation during shutdown.
+
+        Args:
+            lease: Unsubmitted reservation from this runtime's task executor.
+            session: Client session captured when the HTTP request was admitted.
+            fn: Client operation to invoke only while that session remains current.
+            args: Positional arguments passed to fn.
+            cleanup: Zero-argument cleanup callable owned by the submitted job.
+
+        Raises:
+            RuntimeError: The reservation is invalid or task admission has stopped.
+        """
+
         def run():
             try:
                 self.client._run_in_session(session, fn, *args)
@@ -28,6 +52,16 @@ class WebRuntime:
 
 
 class BoundedHTTPServer(HTTPServer):
+    """Serve HTTP using bounded handlers and coordinated client cleanup.
+
+    Construction binds the supplied address and starts handler workers. The Web entry
+    point supplies a loopback address; this class does not enforce loopback itself.
+
+    Attributes:
+        runtime: Send runtime supplied by the handler class.
+        handlers: Owned request executor, or None before successful initialization.
+    """
+
     def __init__(self, address, handler):
         self.runtime = handler.runtime
         self.handlers = None
@@ -49,6 +83,11 @@ class BoundedHTTPServer(HTTPServer):
             raise
 
     def serve_forever(self, poll_interval=0.1):
+        """Serve requests until shutdown is signalled or the backend is closing.
+
+        Args:
+            poll_interval: Requested listener readiness wait in seconds, capped at 0.1.
+        """
         with self._requests_lock:
             if self._closing:
                 return
@@ -78,6 +117,14 @@ class BoundedHTTPServer(HTTPServer):
                 raise RuntimeError("HTTP shutdown incomplete: serving still running")
 
     def shutdown(self):
+        """Stop HTTP serving within the shutdown timeout without closing all resources.
+
+        The serving thread does not wait for itself. Other callers wait for the serve loop;
+        server_close() remains responsible for sockets, client state, and worker pools.
+
+        Raises:
+            RuntimeError: The serve loop does not finish before the shutdown deadline.
+        """
         self._stop_serving(time.monotonic() + SHUTDOWN_TIMEOUT)
 
     def process_request(self, request, address):
@@ -113,6 +160,13 @@ class BoundedHTTPServer(HTTPServer):
             lease.release()
 
     def server_close(self):
+        """Close HTTP sockets, client state, and both worker pools within one deadline.
+
+        Cleanup steps continue after individual failures, which are reported together.
+
+        Raises:
+            RuntimeError: Close ownership, serving, worker joins, or cleanup is incomplete.
+        """
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT
         if not self._close_lock.acquire(timeout=max(0, deadline - time.monotonic())):
             raise RuntimeError("HTTP shutdown incomplete: close lock busy")

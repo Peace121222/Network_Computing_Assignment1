@@ -41,7 +41,23 @@ WIDTH = A4[0] - 92
 
 
 def evidence(path):
-    """Require a completed successful run matching the current test inventory."""
+    """Read successful unittest evidence matching the current source test inventory.
+
+    The log is read without rerunning tests. Test modules are parsed to count test_
+    functions; missing metadata falls back to the log's modification time or a label.
+
+    Args:
+        path: Test log path, read as text.
+
+    Returns:
+        Report metadata containing count, duration, outcome, per-module inventory,
+        recorded time, and environment description.
+
+    Raises:
+        ValueError: The log lacks a successful final summary or its count differs from
+            the current test inventory.
+        OSError: Reading the log or test sources fails.
+    """
     text = path.read_text()
     runs = re.findall(r"^Ran (\d+) tests? in ([\d.]+)s$", text, re.M)
     outcome = next(
@@ -82,6 +98,8 @@ def evidence(path):
 
 
 class Diagram(Flowable):
+    """Provide shared drawing helpers for report flowables using PDF-point coordinates."""
+
     def __init__(self, height):
         super().__init__()
         self.width, self.height = WIDTH, height

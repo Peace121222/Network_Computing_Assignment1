@@ -1,65 +1,70 @@
 """Bounded threaded TCP sessions and encrypted UDP relay."""
 
 from __future__ import annotations
-from typing import Any
-
-
-from collab.shared.limits import (
-    SHUTDOWN_TIMEOUT,
-    CONTROL_TIMEOUT,
-    UDP_PATH_CHALLENGE_TIMEOUT,
-    UDP_PATH_CHALLENGE_INTERVAL,
-)
 
 import argparse
-import ssl
-import sqlite3
-from cryptography.fernet import Fernet
-from collab.accounts import Accounts, AuthLimiter
-from collab.transport.tls import server_context
 import errno
-from functools import wraps
-import sys
-from collections import deque, OrderedDict
-from contextlib import ExitStack, nullcontext
 import logging
 import math
 import select
 import socket
+import sqlite3
+import ssl
+import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict, deque
+from contextlib import ExitStack, nullcontext
+from functools import wraps
+from typing import Any
+
+from cryptography.fernet import Fernet
+
+from collab.accounts import Accounts, AuthLimiter
+from collab.server.file_transfers import ServerFileTransfers
+from collab.server.routing import RelayRouter
 from collab.shared.limits import (
+    CONTROL_TIMEOUT,
+    FILE_IDLE_TIMEOUT,
+    FILE_TRANSFER_TIMEOUT,
     LOGIN_TIMEOUT,
-    SESSION_TIMEOUT,
-    SERVER_POLL_TIMEOUT,
     RETRY_POLL_INTERVAL,
-    SESSION_EXPIRY,
+    SERVER_POLL_TIMEOUT,
     SESSION_CHECK_INTERVAL,
+    SESSION_EXPIRY,
+    SESSION_TIMEOUT,
+    SHUTDOWN_TIMEOUT,
+    UDP_MTU,
+    UDP_PATH_CHALLENGE_INTERVAL,
+    UDP_PATH_CHALLENGE_TIMEOUT,
 )
-from collab.transport.udp import encode_udp
-from collab.transport.tcp import send_tcp, frame_tcp
+from collab.shared.protocol import validate_tcp, validate_udp
+from collab.shared.resilience import Cleanup, RetryDelay, SendBackoff, retryable
 from collab.transport.handshake import server_login
 from collab.transport.security import Channel, nonce, unseal
-from collab.transport.udp import udp_frame_size
-from collab.shared.limits import UDP_MTU
-from collab.shared.protocol import validate_tcp, validate_udp
-
-from collab.shared.resilience import Cleanup, RetryDelay, SendBackoff, retryable
-from collab.server.routing import RelayRouter
-from collab.server.file_transfers import ServerFileTransfers
-from collab.shared.limits import FILE_IDLE_TIMEOUT, FILE_TRANSFER_TIMEOUT
+from collab.transport.tcp import TCPReader, frame_tcp, send_tcp
+from collab.transport.tls import server_context
+from collab.transport.udp import encode_udp, udp_frame_size
 
 log = logging.getLogger(__name__)
 
 
 class Server:
-    """Bounded relay server with session-owned handlers and writers.
+    """Own account storage, active sessions, and the TCP/UDP relay workers.
 
-    Concurrency: lock protects the registry, revision and routing state. Lifecycle
-    ownership serializes start/cleanup; _error_lock protects first-error and stop
-    requests. Session udp_lock gates serialize sends/removal; control_condition protects
-    each writer mailbox. Workers signal stop without waiting for lifecycle ownership.
+    The registry lock protects sessions and routing state. Lifecycle ownership
+    serializes startup/cleanup; worker failures signal shutdown without waiting for
+    that ownership. Session gates serialize UDP sends with session removal.
+
+    Attributes:
+        host: Address used to bind the TCP and UDP listeners.
+        tcp_port: TCP port, updated after an OS-assigned bind when configured as zero.
+        udp_port: UDP port, updated after an OS-assigned bind when configured as zero.
+        database: SQLite account path used during start().
+        users: Username-to-session registry, protected by lock.
+        connections: Accepted sockets, including unauthenticated connections.
+        status: Current server lifecycle status.
     """
 
     status: str
@@ -144,13 +149,24 @@ class Server:
 
     @property
     def last_error(self) -> dict[str, Any] | None:
+        """Return a copy of the first recorded startup or worker failure.
+
+        Returns:
+            Failure details, or None if the current run has not recorded a failure.
+        """
         with self._error_lock:
             return None if self._last_error is None else dict(self._last_error)
 
     def _request_stop(self, worker=None, error=None, run_id=None):
-        """Signal-only worker path: hold _error_lock, never acquire the lifecycle lock or
-        join a worker. The first error and run identity prevent stale worker failures
-        affecting a later run.
+        """Signal shutdown and record the first worker failure for the active run.
+
+        Only the error lock is acquired; this path does not join workers or wait for
+        lifecycle ownership. Requests tagged with an older run identity are ignored.
+
+        Args:
+            worker: Optional worker name included in failure details.
+            error: Optional failure recorded if no earlier error exists.
+            run_id: Optional run identity used to reject stale worker callbacks.
         """
         with self._error_lock:
             if run_id is not None and run_id is not self._run_id:
@@ -235,6 +251,16 @@ class Server:
         return thread
 
     def start(self) -> None:
+        """Initialize accounts, bind listeners, and start owned server workers.
+
+        Listeners and workers created during startup are cleaned up if startup fails.
+        An existing stopped instance can start again once its workers have exited.
+
+        Raises:
+            ValueError: A TLS certificate/private-key context was not configured.
+            RuntimeError: A lifecycle operation is active or the server is not fully stopped.
+            OSError: Listener creation or binding fails.
+        """
         if not self._lifecycle_lock.acquire(False):
             raise RuntimeError("Server lifecycle operation in progress")
         try:
@@ -305,9 +331,17 @@ class Server:
                 raise
 
     def _stop(self, deadline=None):
-        """Caller owns _lifecycle_lock. _cleanup_active tells the supervisor to exit
-        instead of waiting for that owner. Snapshot under the registry lock, then close
-        sockets and join outside it; retain unfinished resources.
+        """Release server resources while retaining failures for a cleanup retry.
+
+        The caller owns the lifecycle lock. The cleanup flag lets the supervisor exit
+        without waiting on that lock. Registry snapshots are taken under the registry
+        lock; sockets are closed and workers joined after releasing it.
+
+        Args:
+            deadline: Absolute monotonic deadline in seconds, or None for the default.
+
+        Raises:
+            RuntimeError: Registry access, worker termination, or resource cleanup fails.
         """
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
         cleanup = Cleanup()
@@ -373,6 +407,14 @@ class Server:
             self._cleanup_active.clear()
 
     def close(self) -> None:
+        """Stop listeners and sessions and join workers within the shutdown deadline.
+
+        A server worker only signals shutdown; lifecycle ownership and joining are left
+        to the supervisor or an external closer.
+
+        Raises:
+            RuntimeError: Lifecycle ownership or resource cleanup cannot complete in time.
+        """
         if threading.current_thread() in self.threads:
             self._request_stop()
             return
@@ -387,8 +429,15 @@ class Server:
             self._lifecycle_lock.release()
 
     def _snapshot_locked(self, typ: str = "presence") -> dict[str, Any]:
-        """Caller must hold self.lock. Return the requested message type, sorted ready
-        usernames and current revision; pending logins are never published.
+        """Build an online-user snapshot from ready sessions.
+
+        The caller must hold the registry lock; pending logins are excluded.
+
+        Args:
+            typ: Message type to put in the snapshot, normally presence or users.
+
+        Returns:
+            A new dictionary containing sorted usernames and the current revision.
         """
         return {
             "type": typ,
@@ -397,9 +446,21 @@ class Server:
         }
 
     def remove_session(self, name, token, *, notify=True, expired_at=None):
-        """Look up under self.lock, release it before waiting for the session gate, then
-        recheck identity under the registry lock. Never hold the registry lock while
-        waiting for a gate or writing sockets.
+        """Remove a matching session and retire its pending work and TCP socket.
+
+        The registry lock is released before acquiring the session UDP gate, then identity
+        is checked again under the registry lock. During shutdown, the gate is bypassed.
+        A replacement login with the same username is left untouched.
+
+        Args:
+            name: Username whose active session is being removed.
+            token: Token identifying the expected session.
+            notify: Whether to request an online-user update while the server is running.
+            expired_at: Optional monotonic observation time in seconds; removal is cancelled
+                if the latest activity no longer qualifies as expired at that time.
+
+        Returns:
+            True if the matching session was removed; False if absent, replaced, or active.
         """
         with self.lock:
             user = self.users.get(name)
@@ -443,6 +504,11 @@ class Server:
         return True
 
     def expire_sessions(self, now=None):
+        """Remove sessions still expired after rechecking their latest activity.
+
+        Args:
+            now: Monotonic observation time in seconds, or None to read the current clock.
+        """
         now = time.monotonic() if now is None else now
         with self.lock:
             expired = [
@@ -502,9 +568,14 @@ class Server:
             frame = frame[count:]
 
     def control_writer(self, name, user):
-        """control_condition protects mailbox selection only. Release it before the bounded
-        TCP write or session cleanup; no global registry lock is held during socket
-        writes.
+        """Drain one session's bounded control mailboxes and write TCP frames.
+
+        The mailbox condition is released before socket writes or session removal.
+        On exit, the matching session is removed without affecting a replacement login.
+
+        Args:
+            name: Username owning the writer.
+            user: Session record captured when the writer started.
         """
         chat_streak = 0
         file_turn = True
@@ -589,8 +660,14 @@ class Server:
                     self.publish_presence()
 
     def publish_presence(self, target=None):
-        """Snapshot ready sessions under self.lock; enqueue controls or send UDP after
-        releasing it. TCP writes belong to per-session writers, not this shared loop.
+        """Send an online-user snapshot to all ready sessions or a selected user.
+
+        The registry is snapshotted under its lock. UDP sends and TCP mailbox updates
+        happen afterward; oversized snapshots use the per-session TCP writer. A session
+        whose TCP mailbox cannot accept the snapshot is removed.
+
+        Args:
+            target: Optional username to receive the update; None selects all ready users.
         """
         with self.lock:
             snapshot = self._snapshot_locked()
@@ -647,7 +724,29 @@ class Server:
                     break
                 log.exception("Could not start connection handler")
 
-    def _authenticate_request(self, request, conn, deadline):
+    def _complete_tls_handshake(self, conn: ssl.SSLSocket, deadline: float) -> None:
+        """Keep handshake polling interruptible; the handler retains socket ownership."""
+        conn.setblocking(False)
+        while True:
+            if self.stopping.is_set() or time.monotonic() >= deadline:
+                raise TimeoutError("TLS handshake deadline exceeded")
+            try:
+                conn.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                select.select(
+                    [conn], [], [], min(0.1, max(0, deadline - time.monotonic()))
+                )
+            except ssl.SSLWantWriteError:
+                select.select(
+                    [], [conn], [], min(0.1, max(0, deadline - time.monotonic()))
+                )
+        conn.settimeout(max(0.001, deadline - time.monotonic()))
+
+    def _authenticate_request(
+        self, request: dict[str, Any], conn: socket.socket, deadline: float
+    ) -> bool:
+        """Consume credentials and send failures; only a valid login returns True."""
         if request["type"] == "register":
             try:
                 self.accounts.register(request["name"], request.pop("password"))
@@ -655,18 +754,28 @@ class Server:
             except ValueError as exc:
                 response = dict(type="error", message=str(exc))
             send_tcp(conn, response, deadline)
-            return
-        request["authenticated"] = self.accounts.verify(
-            request["name"], request.pop("password")
-        )
-        if not request["authenticated"]:
+            return False
+        authenticated = self.accounts.verify(request["name"], request.pop("password"))
+        if not authenticated:
             send_tcp(
                 conn,
                 dict(type="error", message="Invalid username or password"),
                 deadline,
             )
+        return authenticated
 
     def handle_client(self, conn, deadline=None):
+        """Own TLS authentication, session service, and cleanup for an accepted socket.
+
+        Registration or authentication failure closes without creating an online session.
+        Successful login reserves the username under the registry lock. Expected socket,
+        validation, lifecycle, and database errors are logged before cleanup.
+
+        Args:
+            conn: Accepted TCP socket transferred to this handler.
+            deadline: Absolute monotonic authentication deadline in seconds, or None
+                for LOGIN_TIMEOUT seconds from the call.
+        """
         name = token = None
         deadline = time.monotonic() + LOGIN_TIMEOUT if deadline is None else deadline
         try:
@@ -678,22 +787,7 @@ class Server:
             with self.lock:
                 self.connections.discard(original)
                 self.connections.add(conn)
-            conn.setblocking(False)
-            while True:
-                if self.stopping.is_set() or time.monotonic() >= deadline:
-                    raise TimeoutError("TLS handshake deadline exceeded")
-                try:
-                    conn.do_handshake()
-                    break
-                except ssl.SSLWantReadError:
-                    select.select(
-                        [conn], [], [], min(0.1, max(0, deadline - time.monotonic()))
-                    )
-                except ssl.SSLWantWriteError:
-                    select.select(
-                        [], [conn], [], min(0.1, max(0, deadline - time.monotonic()))
-                    )
-            conn.settimeout(max(0.001, deadline - time.monotonic()))
+            self._complete_tls_handshake(conn, deadline)
             if not self.auth_limiter.allow(conn.getpeername()[0]):
                 send_tcp(
                     conn,
@@ -704,33 +798,32 @@ class Server:
                     deadline,
                 )
                 return
-            hello, reader = server_login(conn, deadline, self.stopping)
-            transcript = {}
+            request, reader = server_login(conn, deadline, self.stopping)
             if not self.accounts.slots.acquire(
                 timeout=max(0, deadline - time.monotonic())
             ):
                 raise TimeoutError("Authentication capacity timeout")
             try:
-                self._authenticate_request(hello, conn, deadline)
+                authenticated = self._authenticate_request(request, conn, deadline)
             finally:
                 self.accounts.slots.release()
-            if hello["type"] == "register" or not hello.pop("authenticated", False):
+            if not authenticated:
                 return
             if time.monotonic() >= deadline:
                 raise TimeoutError("Authentication deadline exceeded")
             try:
-                validate_tcp(hello, from_client=True)
-                if hello["type"] != "login":
+                validate_tcp(request, from_client=True)
+                if request["type"] != "login":
                     raise ValueError("Expected login")
             except ValueError:
                 send_tcp(
                     conn,
-                    dict(type="error", message="Invalid login", **transcript),
+                    dict(type="error", message="Invalid login"),
                     deadline=deadline,
                     security=reader.security,
                 )
                 return
-            name = hello["name"]
+            name = request["name"]
             with self.lock:
                 duplicate = name in self.users
                 if not duplicate and self.running.is_set():
@@ -758,7 +851,7 @@ class Server:
             if duplicate:
                 send_tcp(
                     conn,
-                    dict(type="error", message="User already connected", **transcript),
+                    dict(type="error", message="User already connected"),
                     deadline=deadline,
                     security=reader.security,
                 )
@@ -773,7 +866,6 @@ class Server:
                     udp_port=self.udp_port,
                     session=user["public_id"],
                     key=session_key.decode(),
-                    **transcript,
                 ),
                 deadline=deadline,
                 security=reader.security,
@@ -794,35 +886,7 @@ class Server:
                 user["ready"] = True
                 self.revision += 1
             self.presence_dirty.set()
-            while self.running.is_set():
-                try:
-                    msg = reader.read()
-                except socket.timeout:
-                    continue
-                validate_tcp(msg, from_client=True)
-                if msg["type"] not in {"logout", "users", "file_receipt", "file_abort"}:
-                    raise ValueError("Unexpected TCP message after login")
-                if msg["type"] == "logout":
-                    break
-                if msg["type"] in ("file_receipt", "file_abort"):
-                    with self.lock:
-                        if self.users.get(name) is not user:
-                            break
-                        if time.monotonic() - user["last_seen"] >= self.session_expiry:
-                            break
-                        if msg["type"] == "file_receipt":
-                            self.file_transfers.receipt(
-                                name, user, msg, time.monotonic()
-                            )
-                        else:
-                            self.file_transfers.abort(
-                                user, msg["transfer"], time.monotonic()
-                            )
-                if msg["type"] == "users":
-                    with self.lock:
-                        snapshot = self._snapshot_locked("users")
-                    if not self._send_control(user, snapshot):
-                        break
+            self._serve_session(name, user, reader)
         except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error) as exc:
             log.debug("TCP exit: %s", exc)
         finally:
@@ -832,11 +896,58 @@ class Server:
             with self.lock:
                 self.connections.discard(conn)
 
+    def _serve_session(
+        self, name: str, user: dict[str, Any], reader: TCPReader
+    ) -> None:
+        """Read control messages until logout or loss; the handler owns cleanup."""
+        while self.running.is_set():
+            try:
+                msg = reader.read()
+            except socket.timeout:
+                continue
+            validate_tcp(msg, from_client=True)
+            if msg["type"] not in {"logout", "users", "file_receipt", "file_abort"}:
+                raise ValueError("Unexpected TCP message after login")
+            if msg["type"] == "logout":
+                break
+            if msg["type"] in ("file_receipt", "file_abort"):
+                with self.lock:
+                    if self.users.get(name) is not user:
+                        break
+                    if time.monotonic() - user["last_seen"] >= self.session_expiry:
+                        break
+                    if msg["type"] == "file_receipt":
+                        self.file_transfers.receipt(name, user, msg, time.monotonic())
+                    else:
+                        self.file_transfers.abort(
+                            user, msg["transfer"], time.monotonic()
+                        )
+            if msg["type"] == "users":
+                with self.lock:
+                    snapshot = self._snapshot_locked("users")
+                if not self._send_control(user, snapshot):
+                    break
+
     def _send_session_udp(self, message, sessions, address=None):
-        # Session gates serialize removal with sends; never wait for them under registry lock.
-        """Acquire session gates in token order before the brief registry check. Revalidate
-        source/destination identity, release the registry lock, then encode/send. A
-        retired session cannot send with a replacement session endpoint.
+        """Send UDP only while all supplied session identities are still current.
+
+        Session gates are acquired in token order before a short registry check. The
+        registry lock is released before encryption or socket I/O. Source and destination
+        records pin a relay send to the original sessions.
+
+        Args:
+            message: Server UDP message dictionary.
+            sessions: Ordered username/session pairs, with the destination last.
+            address: Optional endpoint override for path challenges; otherwise the
+                destination's verified UDP address is used.
+
+        Returns:
+            True when sendto() succeeds; False for stale identity, a missing endpoint or
+            socket, backoff, a retryable send error, or a socket error during shutdown.
+
+        Raises:
+            ValueError: The encoded datagram exceeds the protocol size limit.
+            OSError: A non-retryable send error occurs outside shutdown.
         """
         unique = {user["token"]: (name, user) for name, user in sessions}
         with ExitStack() as stack:
@@ -885,6 +996,16 @@ class Server:
             self.handle_udp(raw, addr)
 
     def handle_udp(self, raw, addr):
+        """Validate a datagram before updating endpoint, replay, and relay state.
+
+        The public prefix selects a candidate cipher but is not trusted as authentication.
+        Invalid, stale, replayed, and oversize messages are discarded. New endpoints must
+        complete a path challenge before application traffic can refresh heartbeat state.
+
+        Args:
+            raw: Received datagram bytes, including the public lookup prefix.
+            addr: Source IP/port tuple supplied by recvfrom().
+        """
         if len(raw) > UDP_MTU:
             return
         try:
@@ -976,9 +1097,23 @@ class Server:
         return self._router._chat_outcome_locked(item, name, outcome)
 
     def route(self, msg, source_addr):
+        """Delegate a validated application packet to the session-bound relay router.
+
+        Args:
+            msg: Client data packet with validated sender credentials and schema.
+            source_addr: Endpoint used for the ingress ACK after admission.
+
+        Returns:
+            True if the packet is accepted; False if identity, capacity, or routing rejects it.
+        """
         return self._router.route(msg, source_addr)
 
     def retransmit_once(self, now=None):
+        """Run one relay retry and expiry pass at the supplied monotonic time.
+
+        Args:
+            now: Optional monotonic time in seconds; None reads the current clock.
+        """
         return self._router.retransmit_once(now)
 
     def retransmit_loop(self):
@@ -988,6 +1123,11 @@ class Server:
 
 
 def main() -> int:
+    """Run the server until interruption or a supervised worker failure.
+
+    Returns:
+        Zero for a normal interrupt; one for a reported startup, worker, or cleanup error.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--tcp-port", type=int, default=9000)

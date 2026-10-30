@@ -30,6 +30,15 @@ def _require(condition: bool, message: str) -> None:
 
 
 def valid_name(name: Any) -> bool:
+    """Check the existing case-sensitive username syntax.
+
+    Args:
+        name: Untrusted value to check without normalization.
+
+    Returns:
+        True for 1 to MAX_USERNAME Unicode letters/digits/underscores with at least one
+        letter or digit; False otherwise.
+    """
     return (
         isinstance(name, str)
         and 1 <= len(name) <= MAX_USERNAME
@@ -61,7 +70,18 @@ def _names(value):
 
 
 def validate_tcp(msg: Any, *, from_client: bool) -> dict[str, Any]:
-    """Validate a control message for its direction; raise ValueError on failure."""
+    """Validate a TCP control message for its wire direction.
+
+    Args:
+        msg: Untrusted decoded message.
+        from_client: Whether the message travels from client to server.
+
+    Returns:
+        The original dictionary, without copying or mutation.
+
+    Raises:
+        ValueError: The message type, direction, or required fields are invalid.
+    """
     _require(isinstance(msg, dict), "TCP message must be a JSON object")
     typ = msg.get("type")
     allowed = (
@@ -218,8 +238,18 @@ def validate_tcp(msg: Any, *, from_client: bool) -> dict[str, Any]:
 def validate_udp(msg: Any, *, from_client: bool) -> dict[str, Any]:
     """Validate decrypted UDP structure before endpoint updates or packet ACKs.
 
-    Packet ACKs acknowledge one hop, not application-level file completion.
-    Transfer lifecycle checks belong to the receiver, beyond this wire schema.
+    Hop ACKs do not establish application-level file completion. Transfer lifecycle
+    checks belong to the receiver, beyond this wire schema.
+
+    Args:
+        msg: Untrusted decoded message.
+        from_client: Whether the message travels from client to server.
+
+    Returns:
+        The original dictionary, without copying or mutation.
+
+    Raises:
+        ValueError: The message schema, payload, or metadata is invalid.
     """
     _require(isinstance(msg, dict), "UDP message must be a JSON object")
     typ = msg.get("type")
@@ -309,6 +339,17 @@ def validate_udp(msg: Any, *, from_client: bool) -> dict[str, Any]:
 def data_packet(
     to: str, kind: str, payload: str = "", meta: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    """Create a data packet with a random application-level ID.
+
+    Args:
+        to: Recipient username, or * for broadcast.
+        kind: Data kind to place in the packet; validation is deferred to callers.
+        payload: Chat text or encoded file chunk, or empty for file control messages.
+        meta: Metadata dictionary retained by reference, or None for a fresh empty one.
+
+    Returns:
+        A packet dictionary without sender credentials or a security envelope.
+    """
     import uuid
 
     return {
@@ -322,8 +363,20 @@ def data_packet(
 
 
 def b64(raw: bytes) -> str:
+    """Encode bytes as an ASCII base64 string."""
     return base64.b64encode(raw).decode("ascii")
 
 
 def unb64(value: str) -> bytes:
+    """Decode base64 with strict alphabet and padding validation.
+
+    Args:
+        value: ASCII base64 payload.
+
+    Returns:
+        The decoded bytes, including empty bytes for an empty payload.
+
+    Raises:
+        ValueError: The payload is not valid base64 or cannot be used as ASCII input.
+    """
     return base64.b64decode(value, validate=True)

@@ -1,4 +1,9 @@
-"""Disposable TLS/account fixtures for existing network behavior tests."""
+"""Provide disposable account and TLS fixtures for network regression tests.
+
+Import creates a temporary CA directory and certificate files for test clients.
+Server/database directories are retained until process cleanup. Production client
+and server behavior is exercised after test-only account provisioning.
+"""
 
 import tempfile
 import atexit
@@ -17,6 +22,13 @@ atexit.register(_resources.cleanup)
 
 
 class Server(RealServer):
+    """Supply disposable databases and certificates for production-server tests.
+
+    Tests may inject synthetic session dictionaries; handle_udp() adds their lookup
+    identities before delegating. Authentication-specific tests restore their own
+    limiter settings when exercising the production rate policy.
+    """
+
     def __init__(self, *args, **kwargs):
         self._test_directory = tempfile.TemporaryDirectory()
         kwargs.setdefault(
@@ -44,6 +56,12 @@ class Server(RealServer):
 
 
 class Client(RealClient):
+    """Provision test accounts before connecting through the production client.
+
+    Unconnected unit fixtures also receive a synthetic cipher for packet tests. These
+    default credentials and provisioning behavior exist only in the test subclass.
+    """
+
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("cafile", str(ROOT / "ca.crt"))
         super().__init__(*args, **kwargs)

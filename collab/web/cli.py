@@ -3,30 +3,37 @@
 import argparse
 import logging
 import sys
-from collab.client.terminal_auth import authenticate
+
+from collab.client.terminal_auth import add_connection_arguments, authenticate
 from .handlers import handler_factory
 from .runtime import BoundedHTTPServer
 
+log = logging.getLogger(__name__)
+
 
 def main() -> int:
-    a = argparse.ArgumentParser()
-    a.add_argument("--name")
-    a.add_argument("--host", default="127.0.0.1")
-    a.add_argument("--port", type=int, default=9000)
-    a.add_argument("--web-port", type=int, default=8080)
-    a.add_argument("--downloads", default="downloads")
-    a.add_argument("--ca", required=True)
-    a.add_argument("--server-name")
-    opts = a.parse_args()
+    """Authenticate in the terminal and serve the local browser interface.
+
+    The HTTP listener opens only after login. Shutdown closes the HTTP runtime and
+    its client, or closes the client directly if HTTP startup did not finish.
+
+    Returns:
+        Zero for a normal exit, EOF, or interrupt; one for a reported backend or
+        cleanup failure.
+    """
+    parser = argparse.ArgumentParser()
+    add_connection_arguments(parser)
+    parser.add_argument("--web-port", type=int, default=8080)
+    args = parser.parse_args()
     client = http = None
     result = 0
     try:
-        client = authenticate(opts)
+        client = authenticate(args)
         if client is None:
             return 0
-        http = BoundedHTTPServer(("127.0.0.1", opts.web_port), handler_factory(client))
+        http = BoundedHTTPServer(("127.0.0.1", args.web_port), handler_factory(client))
         print(
-            f"Open http://127.0.0.1:{opts.web_port} for user {client.name}", flush=True
+            f"Open http://127.0.0.1:{args.web_port} for user {client.name}", flush=True
         )
         http.serve_forever()
     except (KeyboardInterrupt, EOFError):
@@ -35,7 +42,7 @@ def main() -> int:
         print("ERROR: " + str(exc), file=sys.stderr)
         result = 1
     except Exception:
-        logging.getLogger(__name__).exception("HTTP backend failed")
+        log.exception("HTTP backend failed")
         result = 1
     finally:
         try:
@@ -44,7 +51,7 @@ def main() -> int:
             elif client is not None:
                 client.close()
         except Exception as exc:
-            logging.getLogger(__name__).exception("HTTP cleanup failed")
+            log.exception("HTTP cleanup failed")
             print("ERROR: " + str(exc), file=sys.stderr)
             result = 1
     return result

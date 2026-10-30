@@ -1,7 +1,7 @@
-"""Bounded, session-bound file routing and end-to-end delivery results.
+"""Track session-bound file routing and recipient-confirmed delivery results.
 
-All methods run under the server registry lock. Only bounded mailbox and pending
-mutations happen here; TCP writes and UDP encoding/sends belong to the workers.
+State methods require the server registry lock. Mailbox and pending-state mutations
+happen here; TCP writes and UDP encoding/sends belong to the workers.
 """
 
 from collections import OrderedDict
@@ -25,9 +25,14 @@ from collab.transport.udp import udp_frame_size
 
 
 class ServerFileTransfers:
-    """Caller holds server.lock for state methods. Mailbox updates briefly acquire the
-    recipient condition in that order; writers release conditions before I/O or registry
-    cleanup. Stored source/destination tokens pin work to the original sessions.
+    """Track file transactions pinned to source and destination session tokens.
+
+    The caller holds server.lock for state methods. Mailbox updates briefly acquire
+    the recipient condition in that order; writers release conditions before socket
+    I/O or registry cleanup.
+
+    Attributes:
+        records: Ordered transaction records, including cached final results.
     """
 
     def __init__(self, server):
@@ -59,8 +64,9 @@ class ServerFileTransfers:
         }
 
     def publish(self, record):
-        """Caller holds server.lock; enqueue only for the original source session, without
-        writing TCP.
+        """Enqueue a file status for the original source session without TCP I/O.
+
+        The caller must hold server.lock. A replacement source login receives no result.
         """
         source = self.server.users.get(record["source"])
         if source is not None and source["token"] == record["source_token"]:
@@ -81,8 +87,14 @@ class ServerFileTransfers:
             )
 
     def finish(self, record, now):
-        """Caller holds server.lock; finalize a record once and remove its pending packets
-        before publishing the final result.
+        """Finalize a fully resolved record and publish its cached delivery result.
+
+        The caller holds server.lock. Pending packets for the record are removed before
+        publishing; already-finalized or unresolved records are left unchanged.
+
+        Args:
+            record: Mutable file transaction record.
+            now: Monotonic completion time in seconds.
         """
         if record["result"] is not None or any(
             v is None for v in record["states"].values()
@@ -151,8 +163,14 @@ class ServerFileTransfers:
                 del self.records[key]
 
     def remove_session(self, token, now):
-        """Caller holds server.lock; cancel only records pinned to the departing token, not
-        a replacement login.
+        """Cancel file work pinned to a departing session token.
+
+        The caller holds server.lock. Records owned by that source are discarded; a
+        departing recipient resolves only its own still-pending outcomes.
+
+        Args:
+            token: Departing session token, not a username.
+            now: Monotonic observation time in seconds.
         """
         for key, record in list(self.records.items()):
             if record["source_token"] == token:
@@ -194,6 +212,20 @@ class ServerFileTransfers:
                 self.outcome(record, name, "source_aborted", now)
 
     def route(self, msg, source, now):
+        """Admit a validated file packet and schedule relay work for pinned recipients.
+
+        The caller holds server.lock. New transactions require file_start. Accepted packet
+        fingerprints make retries idempotent; conflicting metadata/chunks are rejected.
+
+        Args:
+            msg: Validated client file_start, file_chunk, or file_end packet.
+            source: Active source session matching the packet's credentials.
+            now: Monotonic observation time in seconds.
+
+        Returns:
+            True for admitted packets or accepted duplicates; False for invalid lifecycle,
+            conflicting data, or exhausted capacity. This result controls the ingress ACK.
+        """
         self.expire(now)
         server = self.server
         transfer = msg["meta"]["transfer"]

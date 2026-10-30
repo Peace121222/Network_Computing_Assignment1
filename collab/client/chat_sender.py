@@ -9,6 +9,8 @@ from collab.transport.udp import encode_udp
 
 
 class ChatSender:
+    """Manage outgoing chat admission, progress events, and final result waiting."""
+
     def __init__(self, client):
         self.client = client
 
@@ -49,7 +51,7 @@ class ChatSender:
             if packet["to"] == "*"
             else [packet["to"]]
         )
-        # Reserve the forwarded metadata overhead before submitting anything.
+        # Check forwarded metadata before reserving an outgoing chat slot.
         destination = max(names or [client.name], key=lambda n: len(json.dumps(n)))
         forwarded = dict(
             packet,
@@ -66,6 +68,18 @@ class ChatSender:
         encode_udp(forwarded, client.f)
 
     def chat(self, recipient, text):
+        """Send chat and wait for the server's final recipient result.
+
+        Args:
+            recipient: Account username, or * for broadcast.
+            text: Chat content satisfying character and encrypted-datagram limits.
+
+        Raises:
+            ValueError: Packet validation or datagram-size checks fail.
+            ConnectionError: The session ends or changes while sending.
+            TimeoutError: Delivery remains unconfirmed before the confirmation deadline.
+            RuntimeError: Admission capacity is exhausted or final delivery fails.
+        """
         client = self.client
         session = client._capture_session()
         packet = client.packet(recipient, "chat", text)

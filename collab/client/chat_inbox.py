@@ -12,6 +12,12 @@ from collab.shared.limits import (
 
 
 class ChatInbox:
+    """Buffer validated chat packets for bounded ordering within a receive session.
+
+    Accepted messages and gap notifications are emitted through the supplied callback.
+    Callers serialize state access; this class does not acquire a client state lock.
+    """
+
     def __init__(self, emit):
         self.emit = emit
         self.streams = {}
@@ -30,6 +36,11 @@ class ChatInbox:
                 del self.streams[key]
 
     def set_peers(self, names):
+        """Retire departed peer streams and prune replay state using the current clock.
+
+        Args:
+            names: Latest online usernames, converted to a set without mutating the input.
+        """
         names = set(names)
         departed = (self.peers or set()) - names
         for key, stream in self.streams.items():
@@ -39,6 +50,14 @@ class ChatInbox:
         self._prune(time.monotonic())
 
     def gap_delay(self, now):
+        """Calculate the wait until the earliest buffered stream gap expires.
+
+        Args:
+            now: Monotonic observation time in seconds.
+
+        Returns:
+            Nonnegative seconds until the next gap deadline, or None if no gaps exist.
+        """
         deadlines = [
             s["gap_since"] + CHAT_GAP_TIMEOUT
             for s in self.streams.values()
@@ -64,6 +83,11 @@ class ChatInbox:
         )
 
     def flush(self, now=None):
+        """Emit ready gap notifications, drain buffered chats, and prune expired state.
+
+        Args:
+            now: Monotonic observation time in seconds, or None for the current clock.
+        """
         now = time.monotonic() if now is None else now
         for key, stream in self.streams.items():
             if (
@@ -90,6 +114,19 @@ class ChatInbox:
         self._prune(now)
 
     def accept(self, msg, now=None):
+        """Admit a forwarded chat into bounded ordering and replay state.
+
+        The caller supplies a validated packet and serializes access to this inbox.
+        Admission can emit chats or gap events through the callback.
+
+        Args:
+            msg: Server-forwarded chat with sender-session, channel, and sequence metadata.
+            now: Monotonic arrival time in seconds, or None for the current clock.
+
+        Returns:
+            True if retained, already handled, or an identical cached duplicate; False
+            for conflicting data, exhausted capacity, or an out-of-window sequence.
+        """
         now = time.monotonic() if now is None else now
         self.flush(now)
         meta = msg["meta"]

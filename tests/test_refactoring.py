@@ -167,3 +167,146 @@ class RefactoringTests(unittest.TestCase):
         for path in (ROOT / "collab").rglob("*.py"):
             with self.subTest(path=path.relative_to(ROOT)):
                 ast.parse(path.read_text(encoding="utf-8"), feature_version=(3, 10))
+
+
+class StartupCompatibilityTests(unittest.TestCase):
+    def test_client_entry_points_preserve_connection_defaults_and_overrides(self):
+        from collab.web import cli as web_cli
+
+        for entry, executable in ((cli, "client"), (web_cli, "web")):
+            cases = (
+                (
+                    ["--ca", "demo-ca.crt"],
+                    {
+                        "name": None,
+                        "host": "127.0.0.1",
+                        "port": 9000,
+                        "downloads": "downloads",
+                        "ca": "demo-ca.crt",
+                        "server_name": None,
+                    },
+                ),
+                (
+                    [
+                        "--ca",
+                        "custom-ca.crt",
+                        "--name",
+                        "Alice",
+                        "--host",
+                        "192.0.2.1",
+                        "--port",
+                        "9100",
+                        "--downloads",
+                        "received files",
+                        "--server-name",
+                        "demo.local",
+                    ],
+                    {
+                        "name": "Alice",
+                        "host": "192.0.2.1",
+                        "port": 9100,
+                        "downloads": "received files",
+                        "ca": "custom-ca.crt",
+                        "server_name": "demo.local",
+                    },
+                ),
+            )
+            for arguments, expected in cases:
+                with self.subTest(entry=executable, arguments=arguments):
+                    with (
+                        patch("sys.argv", [executable, *arguments]),
+                        patch.object(
+                            entry, "authenticate", return_value=None
+                        ) as authenticate,
+                    ):
+                        self.assertEqual(entry.main(), 0)
+                    parsed = authenticate.call_args.args[0]
+                    self.assertEqual(
+                        {name: getattr(parsed, name) for name in expected}, expected
+                    )
+                    if executable == "web":
+                        self.assertEqual(parsed.web_port, 8080)
+
+    def test_cli_preserves_message_and_file_contents(self):
+        from unittest.mock import Mock
+
+        client = Mock(status="connected")
+        commands = [
+            "/msg bob hello  with spaces",
+            "/file bob folder/my file.txt",
+            "/all broadcast  text",
+            "/quit",
+        ]
+        with patch("builtins.input", side_effect=commands), patch("builtins.print"):
+            self.assertEqual(cli._run_commands(client), 0)
+        client.chat.assert_any_call("bob", "hello  with spaces")
+        client.chat.assert_any_call("*", "broadcast  text")
+        client.file.assert_called_once_with("bob", "folder/my file.txt")
+
+    def test_certificate_generation_preserves_trust_names_and_private_keys(self):
+        import datetime
+        import ipaddress
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from collab.certgen import generate
+
+        with tempfile.TemporaryDirectory() as directory:
+            generate(directory, ["localhost", "127.0.0.1", "192.0.2.1"])
+            root = Path(directory)
+            self.assertEqual(
+                {path.name for path in root.iterdir()},
+                {"ca.key", "ca.crt", "server.key", "server.crt"},
+            )
+            ca = x509.load_pem_x509_certificate((root / "ca.crt").read_bytes())
+            server = x509.load_pem_x509_certificate((root / "server.crt").read_bytes())
+            ca.public_key().verify(
+                server.signature,
+                server.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                server.signature_hash_algorithm,
+            )
+            self.assertEqual(server.issuer, ca.subject)
+            self.assertTrue(
+                ca.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+            )
+            self.assertFalse(
+                server.extensions.get_extension_for_class(
+                    x509.BasicConstraints
+                ).value.ca
+            )
+            sans = server.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+            self.assertEqual(sans.get_values_for_type(x509.DNSName), ["localhost"])
+            self.assertEqual(
+                sans.get_values_for_type(x509.IPAddress),
+                [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("192.0.2.1")],
+            )
+            self.assertEqual(
+                server.not_valid_after_utc - server.not_valid_before_utc,
+                datetime.timedelta(days=90, minutes=5),
+            )
+            for stem, certificate in (("ca", ca), ("server", server)):
+                path = root / f"{stem}.key"
+                private_key = serialization.load_pem_private_key(
+                    path.read_bytes(), password=None
+                )
+                self.assertEqual(
+                    private_key.public_key().public_numbers(),
+                    certificate.public_key().public_numbers(),
+                )
+                if os.name == "posix":
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_certificate_generation_does_not_overwrite_existing_outputs(self):
+        from collab.certgen import generate
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = root / "server.crt"
+            existing.write_bytes(b"existing certificate")
+            with self.assertRaisesRegex(ValueError, "already exist"):
+                generate(directory, ["localhost"])
+            self.assertEqual(existing.read_bytes(), b"existing certificate")
+            self.assertEqual(list(root.iterdir()), [existing])

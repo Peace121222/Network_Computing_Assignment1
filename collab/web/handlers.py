@@ -15,7 +15,17 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def _load_static(name: str) -> str:
-    """Load fixed package resources at import; no request path reaches the filesystem."""
+    """Read a fixed package resource and fail early if it is unavailable.
+
+    Args:
+        name: Package-controlled resource name, never an untrusted HTTP request path.
+
+    Returns:
+        UTF-8 resource contents.
+
+    Raises:
+        RuntimeError: Reading or UTF-8 decoding fails.
+    """
     try:
         return (STATIC_DIR / name).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
@@ -37,6 +47,17 @@ _STATIC = {
 
 
 def handler_factory(client):
+    """Create HTTP handlers and a bounded send runtime for one client.
+
+    The returned class exposes its runtime to BoundedHTTPServer for coordinated
+    shutdown. Calling this factory starts send-pool workers; it does not bind HTTP.
+
+    Args:
+        client: Client core used directly for event polling, chat, and file operations.
+
+    Returns:
+        A BaseHTTPRequestHandler subclass with the attached runtime.
+    """
     runtime = WebRuntime(client)
 
     class Handler(BaseHTTPRequestHandler):

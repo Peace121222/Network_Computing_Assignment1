@@ -27,6 +27,8 @@ def frame(msg):
 
 
 class Stream:
+    """Simulate fragmented socket reads, timeouts, EOF, and recorded writes."""
+
     def __init__(self, parts):
         self.parts = list(parts)
         self.closed = False
@@ -59,7 +61,11 @@ class Stream:
 
 
 class LoginStream(Stream):
-    """Scripted peer that binds its encrypted replies to each fresh client nonce."""
+    """Simulate login responses at the already-verified TLS transport boundary.
+
+    A scripted welcome gains a session ID and generated key. Credentials and replies
+    use framed JSON here; this helper does not implement TLS or nonce negotiation.
+    """
 
     def sendall(self, raw):
         self.sent.append(raw)

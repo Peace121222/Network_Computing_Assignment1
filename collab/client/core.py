@@ -1,64 +1,68 @@
 """Client socket engine; no high-level networking libraries."""
 
 from __future__ import annotations
-from typing import Any
-
-
-from collab.shared.limits import SHUTDOWN_TIMEOUT
 
 import errno
-from functools import wraps
-from collections import OrderedDict
 import logging
 import math
-from pathlib import Path
 import queue
 import select
 import socket
+import ssl
 import threading
 import time
-from collab.shared.limits import (
-    SEND_WINDOW,
-    CLIENT_RETRIES,
-    RETRY_TIMEOUT,
-    CONNECT_TIMEOUT,
-    HEARTBEAT_INTERVAL,
-    UDP_TIMEOUT,
-    SEND_POLL_INTERVAL,
-    CLIENT_LOGIN_TIMEOUT,
-    LOGOUT_TIMEOUT,
-    SESSION_TIMEOUT,
-    UDP_MTU,
-)
-from collab.transport.udp import encode_udp
-from collab.transport.tcp import send_tcp
-from collab.shared.protocol import validate_tcp, validate_udp, data_packet
+from collections import OrderedDict
+from functools import wraps
+from pathlib import Path
+from typing import Any
+
+from collab.accounts import validate_credentials
 from collab.client.chat_inbox import ChatInbox
-from collab.client.file_transfer import FileTransfers, TransferCapacityError
 from collab.client.chat_sender import ChatSender
+from collab.client.file_transfer import FileTransfers, TransferCapacityError
 from collab.shared.limits import (
+    CLIENT_LOGIN_TIMEOUT,
+    CLIENT_RETRIES,
+    CONNECT_TIMEOUT,
     FILE_IDLE_TIMEOUT,
     FILE_TRANSFER_TIMEOUT,
     FILE_WRITE_QUEUE,
+    HEARTBEAT_INTERVAL,
+    LOGOUT_TIMEOUT,
+    RETRY_TIMEOUT,
+    SEND_POLL_INTERVAL,
+    SEND_WINDOW,
+    SESSION_TIMEOUT,
+    SHUTDOWN_TIMEOUT,
+    UDP_MTU,
+    UDP_TIMEOUT,
 )
-from collab.transport.tcp import write_tcp
-from collab.transport.handshake import client_login
-from collab.transport.tls import client_context
-from collab.accounts import validate_credentials
-from collab.transport.tcp import send_tcp, TCPReader
-from collab.transport.security import Channel, unseal
+from collab.shared.protocol import data_packet, validate_tcp, validate_udp
 from collab.shared.resilience import Cleanup, RetryDelay, SendBackoff, retryable
+from collab.transport.handshake import client_login
+from collab.transport.security import Channel, unseal
+from collab.transport.tcp import TCPReader, send_tcp, write_tcp
+from collab.transport.tls import client_context
+from collab.transport.udp import encode_udp
 
 log = logging.getLogger(__name__)
 
 
 class Client:
-    """Socket client with session-owned workers.
+    """Manage an authenticated client session and its socket workers.
 
-    _lifecycle_lock serializes connect/close ownership; _state_lock protects the active
-    session and receive/send service state. pending_lock protects hop ACK waiters.
-    Worker callbacks must compare session identity and must not wait for lifecycle
-    ownership while a closer may be joining them.
+    The lifecycle lock serializes connect/close operations; the state lock protects
+    session identity and send/receive state. Worker callbacks compare session identity
+    and must not wait for a lifecycle owner that may be joining them.
+
+    Attributes:
+        name: Account username sent during authentication.
+        download_dir: Receive directory, created during construction.
+        events: Queue of connection, presence, chat, file, and error events.
+        names: Latest received online-user list.
+        status: Lifecycle status, initially disconnected.
+        f: Active session cipher, or None when reset or disconnected.
+        pending_lock: Lock protecting hop-ACK waiters.
     """
 
     status: str
@@ -125,7 +129,8 @@ class Client:
                 event["reason"] = reason
             self.events.put(event)
 
-    def _open_tls(self, deadline=None):
+    def _open_tls(self, deadline: float | None = None) -> ssl.SSLSocket:
+        """Transfer socket ownership to the caller only after TLS succeeds."""
         context = client_context(self.cafile)
         raw = socket.create_connection((self.host, self.port), timeout=CONNECT_TIMEOUT)
         try:
@@ -136,7 +141,21 @@ class Client:
             raw.close()
             raise
 
-    def register(self, password, confirmation):
+    def register(self, password: str, confirmation: str) -> None:
+        """Register credentials over a short-lived, server-verified TLS connection.
+
+        The connection closes when the exchange finishes. Registration does not log in
+        or start socket workers.
+
+        Args:
+            password: Password containing 8 to 128 characters.
+            confirmation: Exact repeat of password.
+
+        Raises:
+            ValueError: Credentials are invalid or confirmation does not match.
+            RuntimeError: The server rejects registration or returns no success response.
+            OSError: Connection, TLS verification, or socket I/O fails.
+        """
         validate_credentials(self.name, password)
         if password != confirmation:
             raise ValueError("Passwords do not match")
@@ -149,7 +168,20 @@ class Client:
             if response.get("type") != "registered":
                 raise RuntimeError(response.get("message", "Registration failed"))
 
-    def connect(self, password=None) -> None:
+    def connect(self, password: str | None = None) -> None:
+        """Authenticate and start the workers owned by a new session.
+
+        Partial setup is rolled back on failure. An earlier session's workers must finish
+        before a new connection can start. No automatic reconnect is performed.
+
+        Args:
+            password: Account password. None is rejected by credential validation.
+
+        Raises:
+            ValueError: The username/password or server response is invalid.
+            RuntimeError: A lifecycle operation is active, workers remain, or login fails.
+            OSError: TCP, TLS verification, or UDP setup fails, including timeouts.
+        """
         if not self._lifecycle_lock.acquire(blocking=False):
             raise RuntimeError("Client is already connecting or closing")
         try:
@@ -172,52 +204,8 @@ class Client:
             }
             self._session = session
             try:
-                deadline = time.monotonic() + CLIENT_LOGIN_TIMEOUT
-                self.tcp = self._open_tls(deadline)
-                session["tcp"] = self.tcp
-                hello, reader = client_login(self.tcp, self.name, password, deadline)
-                self.f = reader.security.f
-                session["tcp_security"] = reader.security
-                session["udp_security"] = Channel(self.f, hello["session"])
-                self.token = hello["token"]
-                self.address = (self.tcp.getpeername()[0], hello["udp_port"])
-                self.tcp.setblocking(False)
-                reader.wait_timeout = SESSION_TIMEOUT
-                self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                session["udp"] = self.udp
-                self.udp.bind(("0.0.0.0", 0))
-                self.udp.settimeout(UDP_TIMEOUT)
-                self.send_raw({"type": "heartbeat"})
-                self.threads = [
-                    threading.Thread(
-                        target=self._guard_worker(self.listen, session),
-                        args=(session,),
-                        daemon=True,
-                    ),
-                    threading.Thread(
-                        target=self._guard_worker(self.heartbeats, session),
-                        args=(session,),
-                        daemon=True,
-                    ),
-                    threading.Thread(
-                        target=self._guard_worker(self.listen_tcp, session),
-                        args=(session, reader),
-                        daemon=True,
-                    ),
-                    threading.Thread(
-                        target=self._guard_worker(self.finalize_worker, session),
-                        args=(session,),
-                        daemon=True,
-                    ),
-                ]
-                self.running.set()
-                # Workers wait until all starts succeed, preventing callbacks during rollback.
-                session["started"] = threading.Event()
-                for thread in self.threads:
-                    thread.start()
-                with self._state_lock:
-                    self._set_status("connected")
-                session["started"].set()
+                reader = self._establish_session(session, password)
+                self._start_session_workers(session, reader)
             except BaseException:
                 try:
                     self._cleanup(logout=False)
@@ -226,6 +214,61 @@ class Client:
                 raise
         finally:
             self._lifecycle_lock.release()
+
+    def _establish_session(self, session: dict[str, Any], password: str) -> TCPReader:
+        """Attach TLS/UDP resources before I/O so failed setup can close them."""
+        deadline = time.monotonic() + CLIENT_LOGIN_TIMEOUT
+        self.tcp = self._open_tls(deadline)
+        session["tcp"] = self.tcp
+        welcome, reader = client_login(self.tcp, self.name, password, deadline)
+        self.f = reader.security.f
+        session["tcp_security"] = reader.security
+        session["udp_security"] = Channel(self.f, welcome["session"])
+        self.token = welcome["token"]
+        self.address = (self.tcp.getpeername()[0], welcome["udp_port"])
+        self.tcp.setblocking(False)
+        reader.wait_timeout = SESSION_TIMEOUT
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        session["udp"] = self.udp
+        self.udp.bind(("0.0.0.0", 0))
+        self.udp.settimeout(UDP_TIMEOUT)
+        self.send_raw({"type": "heartbeat"})
+        return reader
+
+    def _start_session_workers(
+        self, session: dict[str, Any], reader: TCPReader
+    ) -> None:
+        """Publish connected status only after every owned worker starts."""
+        self.threads = [
+            threading.Thread(
+                target=self._guard_worker(self.listen, session),
+                args=(session,),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._guard_worker(self.heartbeats, session),
+                args=(session,),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._guard_worker(self.listen_tcp, session),
+                args=(session, reader),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._guard_worker(self.finalize_worker, session),
+                args=(session,),
+                daemon=True,
+            ),
+        ]
+        self.running.set()
+        # Workers wait until all starts succeed, preventing callbacks during rollback.
+        session["started"] = threading.Event()
+        for thread in self.threads:
+            thread.start()
+        with self._state_lock:
+            self._set_status("connected")
+        session["started"].set()
 
     def _reset_session(self, *, clear_events=False):
         self.token = None
@@ -269,8 +312,17 @@ class Client:
                 raise
 
     def _join_workers(self, deadline=None):
-        """Called by the lifecycle owner outside _state_lock; skip the current and
-        unstarted threads and retain live resources for retry.
+        """Join owned workers and retry deferred resource cleanup.
+
+        The caller owns the lifecycle lock and must not hold the state lock. The current
+        thread and unstarted threads are not joined; unfinished resources remain available
+        for a later cleanup attempt.
+
+        Args:
+            deadline: Absolute monotonic deadline in seconds, or None for the default.
+
+        Raises:
+            RuntimeError: Workers, files, or sockets cannot be fully cleaned up.
         """
         current = threading.current_thread()
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
@@ -293,10 +345,14 @@ class Client:
         cleanup.finish("Client shutdown incomplete")
 
     def _detach_session(self, reason=None):
-        """Called under state lock; never joins or waits for lifecycle ownership.
+        """Detach the current session and close its sockets without joining workers.
 
-        Caller must hold _state_lock. Stop/detach only the current session, preserve
-        notification events, and leave joins to the lifecycle owner.
+        The caller must hold the state lock. Pending jobs are cancelled, session state is
+        reset, and connection/presence events are emitted. Existing queued events survive;
+        failed socket closes are retained for retry.
+
+        Args:
+            reason: Optional disconnect reason included in connection and error events.
         """
         session = self._session
         if session is not None:
@@ -332,9 +388,17 @@ class Client:
             self.events.put({"type": "error", "message": reason})
 
     def _cleanup(self, *, logout, deadline=None):
-        """Caller owns _lifecycle_lock (including failed-connect rollback). Detach under
-        _state_lock, release it, then join against the same deadline; workers must not
-        acquire lifecycle ownership.
+        """Detach a session and join its workers within one cleanup deadline.
+
+        The caller owns the lifecycle lock. State is detached under the state lock, which
+        is released before joining workers.
+
+        Args:
+            logout: Whether to attempt a logout control message before detaching.
+            deadline: Absolute monotonic deadline in seconds, or None for the default.
+
+        Raises:
+            RuntimeError: The state lock or resource cleanup cannot complete in time.
         """
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
         cleanup = Cleanup()
@@ -355,8 +419,14 @@ class Client:
         cleanup.finish("Client shutdown incomplete")
 
     def _request_disconnect(self, session, reason):
-        """Worker-safe path: acquire _state_lock, compare the captured session, detach
-        without joining. Late callbacks from a retired session are ignored.
+        """Detach a matching worker session without joining its workers.
+
+        The state lock is acquired internally. Calls from a retired or stopped session
+        have no effect.
+
+        Args:
+            session: Session captured when the worker started.
+            reason: Disconnect reason emitted with client events.
         """
         with self._state_lock:
             if self._session is session and not session["stop"].is_set():
@@ -400,6 +470,14 @@ class Client:
             self._lifecycle_lock.release()
 
     def close(self) -> None:
+        """End the session and release client-owned sockets, workers, and files.
+
+        Worker callers detach without waiting for a lifecycle owner. Other callers attempt
+        logout and join workers within the configured shutdown timeout.
+
+        Raises:
+            RuntimeError: Lifecycle ownership or resource cleanup cannot complete in time.
+        """
         self._close_before(time.monotonic() + SHUTDOWN_TIMEOUT)
 
     def send_control(
@@ -409,6 +487,22 @@ class Client:
         *,
         deadline: float | None = None,
     ) -> None:
+        """Send a validated TCP control message for the specified active session.
+
+        The session write lock serializes control frames. The effective deadline is capped
+        at LOGOUT_TIMEOUT seconds from the call, including the lock wait.
+
+        Args:
+            message: Client-to-server control message.
+            session: Expected active session; None indicates an ended session.
+            deadline: Optional absolute monotonic deadline in seconds.
+
+        Raises:
+            ValueError: The message violates the control schema.
+            ConnectionError: The expected session is absent, stopped, or replaced.
+            TimeoutError: The write lock or socket write exceeds its deadline.
+            OSError: Socket I/O fails.
+        """
         validate_tcp(message, from_client=True)
         if session is None:
             raise ConnectionError("Client session ended")
@@ -434,6 +528,20 @@ class Client:
             lock.release()
 
     def send_raw(self, message: dict[str, Any]) -> None:
+        """Send one authenticated UDP message using the current session.
+
+        A copy of message receives the current username and token before validation.
+        No ACK wait is performed; transient failures update the UDP send backoff.
+
+        Args:
+            message: Client UDP message without required session identity fields.
+
+        Raises:
+            ConnectionError: The client has no active UDP socket or token.
+            ValueError: The message schema or encrypted datagram size is invalid.
+            BlockingIOError: UDP send backoff has not expired.
+            OSError: The socket send fails.
+        """
         with self._state_lock:
             if self.udp is None or self.token is None:
                 raise ConnectionError("Client is disconnected")
@@ -487,9 +595,13 @@ class Client:
                 time.sleep(HEARTBEAT_INTERVAL)
 
     def _apply_presence(self, msg):
-        # Called with state lock by both receiver workers.
-        """Caller must hold _state_lock. Both TCP and UDP readers use this path so old
-        revisions cannot overwrite newer snapshots.
+        """Apply an online-user snapshot whose revision is not older than local state.
+
+        The caller must hold the state lock. Both TCP and UDP receivers use this path;
+        accepted snapshots update peer tracking and emit a presence event.
+
+        Args:
+            msg: Validated presence or users message containing names and revision.
         """
         if msg["revision"] >= self.presence_revision:
             self.presence_revision = msg["revision"]
@@ -674,7 +786,26 @@ class Client:
         file_record=None,
         deadline=None,
     ):
-        """Bounded sliding window; only unacknowledged datagrams are retried."""
+        """Send packets through a sliding window and retry missing hop ACKs.
+
+        ACK waiter entries created by the call are removed on exit. Completion confirms
+        hop acceptance, not final chat delivery or successful file verification.
+
+        Args:
+            packets: Indexed sequence of client UDP packets with application IDs.
+            window: Maximum number of packets awaiting ACKs at once.
+            retries: Maximum send attempts per unacknowledged packet.
+            timeout: Minimum interval between attempts for a packet, in seconds.
+            session: Expected active session, or None to capture the current one.
+            file_record: Optional outgoing file record checked for cancellation/results.
+            deadline: Absolute monotonic file-transfer deadline in seconds. It is checked
+                through file_record; it is not a general chat send deadline.
+
+        Raises:
+            ConnectionError: The expected session ends or is replaced.
+            TimeoutError: ACK attempts or the file-transfer deadline are exhausted.
+            OSError: A non-retryable UDP error occurs.
+        """
         session = self._capture_session() if session is None else session
         inflight = {}
         i = 0
@@ -728,6 +859,17 @@ class Client:
     def packet(
         self, to: str, kind: str, payload: str = "", meta: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        """Build an outbound data packet without attaching session credentials.
+
+        Args:
+            to: Recipient username, or * for broadcast.
+            kind: Application data kind.
+            payload: Chat text or an encoded file chunk; empty for file control packets.
+            meta: Metadata mapping retained by reference, or None for a fresh empty mapping.
+
+        Returns:
+            A new packet dictionary with a random application ID.
+        """
         return data_packet(to, kind, payload, meta)
 
     def _chat_accepted(self, mid, record):
@@ -740,9 +882,38 @@ class Client:
         return self._chat_sender._preflight_chat(packet)
 
     def chat(self, recipient: str, text: str) -> None:
+        """Send chat and wait for the server's final recipient result.
+
+        Args:
+            recipient: Account username, or * for broadcast.
+            text: Chat content satisfying character and encrypted-datagram limits.
+
+        Raises:
+            ValueError: Packet validation or datagram-size checks fail.
+            ConnectionError: The session ends or changes while sending.
+            TimeoutError: Delivery remains unconfirmed before the confirmation deadline.
+            RuntimeError: Admission capacity is exhausted or final delivery fails.
+        """
         return self._chat_sender.chat(recipient, text)
 
     def file(self, recipient: str, path: str | Path) -> None:
+        """Send a file and wait for recipient verification and save receipts.
+
+        The source is hashed and streamed in chunks. Progress/results are placed on the
+        client event queue; temporary outgoing state is released when the call finishes.
+
+        Args:
+            recipient: Account username, or * for broadcast.
+            path: Source path, relative to the process working directory unless absolute.
+
+        Raises:
+            FileNotFoundError: The source path does not name a regular file.
+            ValueError: The file exceeds 25 MiB or packet validation fails.
+            ConnectionError: The captured client session ends or changes.
+            TimeoutError: The transfer or acknowledgement deadline is exhausted.
+            RuntimeError: Outgoing capacity is exhausted, the source changes, or delivery fails.
+            OSError: Reading the source or sending packets fails.
+        """
         return self._file_transfers.file(recipient, path)
 
 

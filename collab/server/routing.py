@@ -20,7 +20,11 @@ RETRANSMIT_BATCH = 128
 
 
 class RelayRouter:
-    """Mutate routing state under server.lock; perform sends outside that lock."""
+    """Manage session-bound relay admission, outcomes, and retransmission state.
+
+    Routing mutations run under server.lock. Actual sends use session gates after the
+    registry lock is released; stored tokens pin each retry to its original sessions.
+    """
 
     def __init__(self, server):
         self.server = server
@@ -42,8 +46,10 @@ class RelayRouter:
             return True
 
     def _publish_chat_result_locked(self, record):
-        """Caller must hold server.lock. Update the matching source session mailbox under
-        its condition; the writer performs I/O after both locks are released.
+        """Publish a completed chat result to the matching source session's mailbox.
+
+        The caller holds server.lock. The source condition protects its mailbox; the TCP
+        writer performs I/O only after both locks are released.
         """
         server = self.server
         if record.get("result") is None:
@@ -75,8 +81,9 @@ class RelayRouter:
             source["control_condition"].notify()
 
     def _chat_outcome_locked(self, item, name, outcome):
-        """Caller must hold server.lock; update only the pinned chat record and its fixed
-        destination outcomes.
+        """Set a pinned recipient outcome and publish when the chat is complete.
+
+        The caller holds server.lock. Only still-pending outcomes are changed.
         """
         server = self.server
         key = item.get("chat_key")
@@ -86,7 +93,10 @@ class RelayRouter:
             self._publish_chat_result_locked(record)
 
     def _expire_chats_locked(self, now):
-        """Caller must hold server.lock; expire records/pending work without socket I/O."""
+        """Expire chat records and pending work without socket I/O.
+
+        The caller must hold server.lock; now is a monotonic timestamp in seconds.
+        """
         server = self.server
         for key, record in list(server.chat_records.items()):
             if record["result"] is None and now >= record["deadline"]:
@@ -101,8 +111,13 @@ class RelayRouter:
                 del server.chat_records[key]
 
     def _admission_locked(self, additions, is_chat):
-        """Caller must hold server.lock so global/per-session capacity checks and later
-        admission remain atomic.
+        """Check pending-packet capacity while preserving reserved chat headroom.
+
+        The caller holds server.lock through this check and any subsequent admission,
+        so global and per-recipient counts cannot change between those operations.
+
+        Returns:
+            True if the proposed additions fit the applicable limits; False otherwise.
         """
         server = self.server
         if len(server.pending) + len(additions) > server.max_pending_packets:
@@ -134,8 +149,13 @@ class RelayRouter:
         return True
 
     def _route_chat_locked(self, msg, source, now):
-        """Caller must hold server.lock. Pin recipients/content once; retries do not
-        allocate a new recipient set or sequence.
+        """Pin a chat's content and recipients before scheduling relay packets.
+
+        The caller holds server.lock. Identical retries reuse the original recipient set
+        and sequence allocation; conflicting retries are rejected.
+
+        Returns:
+            True if admitted or an accepted duplicate; False if rejected or at capacity.
         """
         server = self.server
         self._expire_chats_locked(now)
@@ -215,7 +235,7 @@ class RelayRouter:
                 },
             }
             if udp_frame_size(packet) > UDP_MTU:
-                # A compliant client preflights this; do not accept unforwardable input.
+                # Reject packets that cannot fit after adding relay metadata and framing.
                 with source["control_condition"]:
                     source["chat_mailbox"].pop(key, None)
                 return False
@@ -234,8 +254,14 @@ class RelayRouter:
         return True
 
     def route(self, msg, source_addr):
-        """Perform admission under server.lock, then send the ingress ACK outside it using
-        session gates.
+        """Admit an application packet and ACK accepted ingress outside the registry lock.
+
+        Args:
+            msg: Validated client data packet with sender identity and token.
+            source_addr: Source endpoint to receive the hop ACK.
+
+        Returns:
+            True for an accepted packet; False for stale identity or rejected admission.
         """
         server = self.server
         with server.lock:
@@ -252,9 +278,13 @@ class RelayRouter:
         return accepted
 
     def retransmit_once(self, now=None):
-        """Build a bounded batch under server.lock, then revalidate session-gated sends
-        outside it. Queue rotation avoids starvation without extending lock-held socket
-        work.
+        """Expire stale work and send one bounded relay retry batch.
+
+        A batch is selected under server.lock, then session identities are revalidated
+        by session-gated sends outside that lock. Selected queue entries rotate to the end.
+
+        Args:
+            now: Monotonic observation time in seconds, or None for the current clock.
         """
         server = self.server
         now = time.monotonic() if now is None else now

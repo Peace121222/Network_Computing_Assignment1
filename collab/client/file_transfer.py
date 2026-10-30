@@ -31,10 +31,23 @@ MAX_INCOMING_BYTES = 50 * 1024 * 1024
 
 
 class TransferCapacityError(ValueError):
+    """Signal that receiving a file would exceed the configured capacity."""
+
     pass
 
 
 class FileTransfers:
+    """Coordinate client file state with a session-owned receive disk worker.
+
+    State callbacks are called under the client state lock. The receive worker owns
+    receive streams and temporary-file cleanup; outgoing file() reads its own source.
+
+    Attributes:
+        outgoing: Outgoing transfer records awaiting admission or final receipts.
+        completed: Cached receive outcomes used to recognize transfer retries.
+        orphans: Receive resources whose cleanup must be retried.
+    """
+
     def __init__(self, client):
         self.client = client
         self.outgoing = {}
@@ -54,6 +67,17 @@ class FileTransfers:
         return msg["meta"].get("sender_session", ""), msg["meta"]["transfer"]
 
     def validate_transfer_packet(self, msg):
+        """Check a validated packet against local receive capacity and declared sizes.
+
+        The caller holds the client state lock. Chat packets require no transfer checks.
+
+        Args:
+            msg: Packet already checked against the UDP wire schema.
+
+        Raises:
+            TransferCapacityError: A new transfer would exceed receive capacity.
+            ValueError: A chunk's index or decoded length conflicts with its known transfer.
+        """
         if msg["kind"] == "chat":
             return
         client, meta = self.client, msg["meta"]
@@ -122,7 +146,18 @@ class FileTransfers:
         }
 
     def on_data(self, msg):
-        """Called under the state lock. True means retained, and may be ACKed."""
+        """Admit a packet into receive state without performing receive disk I/O.
+
+        The caller holds the client state lock. New receive work is queued for the session
+        worker. Completed transfers use cached fingerprints and may requeue final receipts.
+
+        Args:
+            msg: Validated incoming application packet.
+
+        Returns:
+            True when the packet can be hop-ACKed, including accepted duplicates; False
+            when rejected or unable to retain its work.
+        """
         client = self.client
         if msg["kind"] == "chat":
             client.events.put(
@@ -238,6 +273,11 @@ class FileTransfers:
         return False
 
     def finish_file(self, key):
+        """Queue final verification after file_end and all declared chunks are written.
+
+        The caller holds the client state lock. Repeated calls do not enqueue another
+        finalization job; a full queue leaves the transfer eligible for a later attempt.
+        """
         f = self.client.files.get(key)
         if (
             not f
@@ -269,13 +309,29 @@ class FileTransfers:
             )
 
     def retry_cleanup(self):
+        """Retry closing and deleting deferred receive resources.
+
+        Raises:
+            RuntimeError: At least one resource still cannot be cleaned up.
+        """
         for f in list(self.orphans.values()):
             self.dispose(f)
         if self.orphans:
             raise RuntimeError("Client shutdown incomplete: file cleanup failed")
 
     def maintenance(self, session, now=None):
-        """State only; disk and TCP work is performed outside the state lock."""
+        """Expire receive state and drain queued receipts without disk or TCP I/O.
+
+        The caller holds the client state lock. Eligible finalizations are enqueued;
+        actual receive disk work and control writes remain with the receive worker.
+
+        Args:
+            session: Session whose queued receipts are removed and returned.
+            now: Monotonic observation time in seconds, or None for the current clock.
+
+        Returns:
+            Receipt message dictionaries ready for TCP sending outside the state lock.
+        """
         now = time.monotonic() if now is None else now
         for key, f in list(self.client.files.items()):
             if (
@@ -293,6 +349,14 @@ class FileTransfers:
         return receipts
 
     def finalize_worker(self, session):
+        """Process receive disk jobs and send completion receipts for one session.
+
+        Temporary files and streams are cleaned up in the worker's finalization path,
+        including after the client detaches. Failed cleanup is retained for retry.
+
+        Args:
+            session: Captured session containing the job queue and file resource registry.
+        """
         client = self.client
         if not client._worker_ready(session):
             return
@@ -485,6 +549,23 @@ class FileTransfers:
             )
 
     def file(self, recipient, path):
+        """Send a file and wait for recipient verification and save receipts.
+
+        The source is hashed and streamed in chunks. Progress/results are placed on the
+        client event queue; temporary outgoing state is released when the call finishes.
+
+        Args:
+            recipient: Account username, or * for broadcast.
+            path: Source path, relative to the process working directory unless absolute.
+
+        Raises:
+            FileNotFoundError: The source path does not name a regular file.
+            ValueError: The file exceeds 25 MiB or packet validation fails.
+            ConnectionError: The captured client session ends or changes.
+            TimeoutError: The transfer or acknowledgement deadline is exhausted.
+            RuntimeError: Outgoing capacity is exhausted, the source changes, or delivery fails.
+            OSError: Reading the source or sending packets fails.
+        """
         client = self.client
         session = client._capture_session()
         path = Path(path)

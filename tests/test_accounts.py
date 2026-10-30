@@ -286,3 +286,23 @@ class TerminalAuthenticationTests(unittest.TestCase):
             self.assertEqual(cli.main(), 0)
         self.assertEqual(order, ["authenticated", "http"])
         http.server_close.assert_called_once()
+
+
+class AuthLimiterCompatibilityTests(unittest.TestCase):
+    def test_denied_attempts_do_not_extend_the_original_window(self):
+        now = [0.0]
+        limiter = AuthLimiter(limit=1, window=5, clock=lambda: now[0])
+        self.assertTrue(limiter.allow("client"))
+        now[0] = 4
+        self.assertFalse(limiter.allow("client"))
+        now[0] = 5
+        self.assertTrue(limiter.allow("client"))
+
+    def test_recently_used_entries_are_retained_at_capacity(self):
+        limiter = AuthLimiter(limit=2, capacity=2, clock=lambda: 0)
+        self.assertTrue(limiter.allow("alice"))
+        self.assertTrue(limiter.allow("bob"))
+        self.assertTrue(limiter.allow("alice"))
+        self.assertTrue(limiter.allow("carol"))
+        self.assertFalse(limiter.allow("alice"))
+        self.assertTrue(limiter.allow("bob"))

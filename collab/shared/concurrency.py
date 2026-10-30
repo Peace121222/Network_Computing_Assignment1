@@ -11,12 +11,21 @@ log = logging.getLogger(__name__)
 
 
 class Reservation:
+    """Represent one worker-pool admission slot.
+
+    Attributes:
+        owner: Executor whose admission count includes this reservation.
+        released: Whether release() has returned the slot.
+        submitted: Whether a job has been submitted using the slot.
+    """
+
     def __init__(self, owner):
         self.owner = owner
         self.released = False
         self.submitted = False
 
     def release(self):
+        """Return the admission slot once and notify waiting pool workers."""
         with self.owner.condition:
             if not self.released:
                 self.released = True
@@ -25,6 +34,17 @@ class Reservation:
 
 
 class BoundedExecutor:
+    """Run tasks with bounded admission and worker-owned cleanup.
+
+    Construction starts daemon workers. Each accepted job owns its reservation until
+    cleanup completes or fails. Failed cleanup is retained for retry during close().
+
+    Attributes:
+        capacity: Total number of admitted running and waiting jobs.
+        admitted: Number of reservations not yet released.
+        threads: Worker threads owned by this executor.
+    """
+
     def __init__(self, workers, waiting, *, name="collab-worker"):
         self.condition = threading.Condition()
         self.capacity = workers + waiting
@@ -51,6 +71,11 @@ class BoundedExecutor:
             raise
 
     def reserve(self):
+        """Reserve admission capacity without blocking for a free slot.
+
+        Returns:
+            A reservation owned by this executor, or None if stopping or at capacity.
+        """
         with self.condition:
             if self.stopping or self.admitted >= self.capacity:
                 return None
@@ -58,6 +83,16 @@ class BoundedExecutor:
             return Reservation(self)
 
     def submit(self, reservation, fn, cleanup=lambda: None):
+        """Transfer a valid reservation and task cleanup to the worker pool.
+
+        Args:
+            reservation: Unreleased, unsubmitted reservation returned by reserve().
+            fn: Zero-argument job callable. Worker failures are logged.
+            cleanup: Zero-argument callable run after execution or cancellation.
+
+        Raises:
+            RuntimeError: The reservation is invalid or the executor is stopping.
+        """
         with self.condition:
             if (
                 reservation.owner is not self
@@ -121,6 +156,19 @@ class BoundedExecutor:
                     self.condition.notify_all()
 
     def stop(self, deadline=None, *, retry_cleanup=False):
+        """Stop admission and schedule pending jobs for cleanup without executing them.
+
+        Active jobs are not interrupted. Cleanup remains worker-owned and is not executed
+        inline by this method.
+
+        Args:
+            deadline: Absolute monotonic lock-acquisition deadline in seconds, or None
+                to acquire the condition lock without a timeout.
+            retry_cleanup: Whether to requeue jobs whose earlier cleanup failed.
+
+        Raises:
+            RuntimeError: The condition lock cannot be acquired before the deadline.
+        """
         if deadline is None:
             acquired = self.condition.acquire()
         else:
@@ -146,6 +194,17 @@ class BoundedExecutor:
             self.condition.release()
 
     def close(self, deadline=None):
+        """Stop admission, retry deferred cleanup, and join owned workers.
+
+        The current worker and unstarted threads are not joined.
+
+        Args:
+            deadline: Absolute monotonic deadline in seconds, or None for the default
+                shutdown timeout.
+
+        Raises:
+            RuntimeError: Lock acquisition, worker termination, or cleanup is incomplete.
+        """
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
         self.stop(deadline, retry_cleanup=True)
         current = threading.current_thread()

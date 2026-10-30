@@ -1,7 +1,7 @@
 """Protocol sizes, resource limits and timing defaults."""
 
 MAX_FRAME = 2_000_000
-UDP_MTU = 1100  # Encrypted datagram bytes, including Fernet overhead.
+UDP_MTU = 1100  # Includes the public lookup prefix and Fernet overhead.
 CHUNK = 320
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MAX_CHUNKS = (MAX_FILE_SIZE + CHUNK - 1) // CHUNK

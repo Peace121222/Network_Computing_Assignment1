@@ -1,22 +1,24 @@
-"""Localhost integration tests using real encrypted TCP and UDP sockets."""
+"""End-to-end messaging, file delivery, production-scale clients, and data-hop loss."""
 
+from pathlib import Path
+from unittest.mock import patch
+import concurrent.futures
 import hashlib
 import os
-from pathlib import Path
 import queue
 import socket
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from tests.auth_support import Client
-from tests.auth_support import Server
+from collab.client import Client as ProductionClient
+from collab.server import Server as ProductionServer
 from collab.shared.protocol import validate_udp
 from collab.transport.udp import encode_udp
+from tests.auth_support import Client, PASSWORD, ROOT, Server
 
 
 class NetworkTests(unittest.TestCase):
@@ -169,6 +171,158 @@ class NetworkTests(unittest.TestCase):
             self.assertEqual(self.a.pending, {})
         self.a.chat("bob", "short message")
         self.assertEqual(self.get_event(self.b, "chat")["text"], "short message")
+
+
+class ProductionScaleTests(unittest.TestCase):
+    def test_twenty_real_clients_share_an_explicit_same_ip_auth_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = ProductionServer(
+                tcp_port=0,
+                udp_port=0,
+                database=str(root / "accounts.db"),
+                certfile=str(ROOT / "server.crt"),
+                keyfile=str(ROOT / "server.key"),
+                auth_limit=60,
+            )
+            clients = []
+            server.start()
+            try:
+                self.assertEqual(server.auth_limiter.limit, 60)
+                for i in range(20):
+                    clients.append(
+                        ProductionClient(
+                            f"prod{i}",
+                            port=server.tcp_port,
+                            cafile=str(ROOT / "ca.crt"),
+                            download_dir=root / f"user{i}",
+                        )
+                    )
+                with concurrent.futures.ThreadPoolExecutor(4) as pool:
+                    list(pool.map(lambda c: c.register(PASSWORD, PASSWORD), clients))
+                barrier = threading.Barrier(20)
+
+                def connect(client):
+                    barrier.wait(5)
+                    client.connect(PASSWORD)
+
+                with concurrent.futures.ThreadPoolExecutor(20) as pool:
+                    list(pool.map(connect, clients))
+                deadline = time.monotonic() + 8
+                while not all(len(c.names) == 20 for c in clients):
+                    self.assertLess(time.monotonic(), deadline)
+                    threading.Event().wait(0.01)
+                source = root / "binary.bin"
+                data = bytes(range(256)) * 24
+                source.write_bytes(data)
+
+                def send(i):
+                    clients[i].chat(clients[(i + 1) % 20].name, f"private {i}")
+                    clients[i].file(clients[(i + 1) % 20].name, source)
+
+                with concurrent.futures.ThreadPoolExecutor(20) as pool:
+                    list(pool.map(send, range(20)))
+                for client in clients:
+                    received = list(client.download_dir.iterdir())
+                    self.assertEqual(len(received), 1)
+                    self.assertEqual(
+                        hashlib.sha256(received[0].read_bytes()).digest(),
+                        hashlib.sha256(data).digest(),
+                    )
+                    self.assertGreater(
+                        client._session["congestion"].snapshot()["acked"], 0
+                    )
+                    self.assertGreater(
+                        server.users[client.name]["congestion"].snapshot()["acked"], 0
+                    )
+                self.assertEqual(len(server.users), 20)
+            finally:
+                for client in clients:
+                    client.close()
+                server.close()
+            self.assertFalse(server.users)
+            self.assertFalse(server.connections)
+
+    def test_authentication_configuration_keeps_secure_defaults(self):
+        server = ProductionServer()
+        self.assertEqual(server.auth_limiter.limit, 10)
+        self.assertEqual(server.auth_limiter.window, 60)
+        for kwargs in (
+            {"auth_limit": 0},
+            {"auth_limit": True},
+            {"auth_window": 0},
+            {"auth_window": float("nan")},
+        ):
+            with self.assertRaises(ValueError):
+                ProductionServer(**kwargs)
+
+    def test_loss_on_each_data_hop_reduces_and_recovers_its_controller(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = ProductionServer(
+                tcp_port=0,
+                udp_port=0,
+                database=str(root / "accounts.db"),
+                certfile=str(ROOT / "server.crt"),
+                keyfile=str(ROOT / "server.key"),
+            )
+            clients = [
+                ProductionClient(
+                    name, port=0, cafile=str(ROOT / "ca.crt"), download_dir=root / name
+                )
+                for name in ("alice", "bob")
+            ]
+            server.start()
+            try:
+                for client in clients:
+                    client.port = server.tcp_port
+                    client.register(PASSWORD, PASSWORD)
+                    client.connect(PASSWORD)
+                a, b = clients
+                deadline = time.monotonic() + 5
+                while b.name not in a.names:
+                    self.assertLess(time.monotonic(), deadline)
+                    threading.Event().wait(0.01)
+                dropped = {"ingress": False, "relay": False}
+                send_client = a.send_raw
+                send_server = server._send_session_udp
+
+                def client_send(message):
+                    if message.get("kind") == "file_chunk" and not dropped["ingress"]:
+                        dropped["ingress"] = True
+                        return
+                    return send_client(message)
+
+                def relay_send(message, sessions, address=None):
+                    if message.get("kind") == "file_chunk" and not dropped["relay"]:
+                        dropped["relay"] = True
+                        return True
+                    return send_server(message, sessions, address)
+
+                source = root / "loss.bin"
+                payload = bytes(range(256)) * 48
+                source.write_bytes(payload)
+                with (
+                    patch.object(a, "send_raw", side_effect=client_send),
+                    patch.object(server, "_send_session_udp", side_effect=relay_send),
+                ):
+                    a.file("bob", source)
+                self.assertTrue(all(dropped.values()))
+                self.assertEqual(next(b.download_dir.iterdir()).read_bytes(), payload)
+                for controller in (
+                    a._session["congestion"],
+                    server.users["bob"]["congestion"],
+                ):
+                    stats = controller.snapshot()
+                    self.assertGreater(stats["loss_events"], 0)
+                    self.assertGreater(stats["retransmissions"], 0)
+                    self.assertEqual(stats["inflight"], 0)
+            finally:
+                for client in clients:
+                    client.close()
+                server.close()
 
 
 if __name__ == "__main__":

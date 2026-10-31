@@ -31,7 +31,7 @@ from collab.transport.tcp import TCPReader, frame_tcp, send_tcp
 from collab.transport.udp import cipher, encode_udp, decode_udp, udp_frame_size
 from collab.transport.handshake import client_login
 from tests.auth_support import tls_connection, PASSWORD, client_login as fixture_login
-from tests.test_handshake import Stream, LoginStream, frame
+from tests.stream_support import Stream, LoginStream, frame
 
 
 def wait(test, predicate, timeout=3):

@@ -15,6 +15,7 @@ from collab.shared.limits import (
     RETRY_TIMEOUT,
 )
 from collab.transport.udp import udp_frame_size
+from collab.transport.congestion import CubicController
 
 RETRANSMIT_BATCH = 128
 
@@ -28,6 +29,7 @@ class RelayRouter:
 
     def __init__(self, server):
         self.server = server
+        self._schedule_phase = 0
 
     def _chat_support(self, user):
         user.setdefault("public_id", uuid.uuid4().hex)
@@ -310,7 +312,10 @@ class RelayRouter:
                         item, key[0], "recipient_disconnected", now
                     )
                     continue
-                if item["retry_time"] > now:
+                congestion = destination.get("congestion")
+                if item["retry_time"] > now and not (
+                    congestion and congestion.is_lost(key[1])
+                ):
                     continue
                 if item["attempts"] >= SERVER_RETRIES:
                     del server.pending[key]
@@ -323,15 +328,39 @@ class RelayRouter:
                     (chats if item["packet"]["kind"] == "chat" else files).append(
                         (key, item, source, destination)
                     )
-            selected = chats[:96] + files[:32]
-            spare = RETRANSMIT_BATCH - len(selected)
-            selected += (chats[96:] + files[32:])[:spare]
+            active_ids = {}
+            for name, packet_id in server.pending:
+                active_ids.setdefault(name, set()).add(packet_id)
+            for name, user in server.users.items():
+                congestion = user.get("congestion")
+                if congestion is None:
+                    congestion = user["congestion"] = CubicController()
+                congestion.retain(active_ids.get(name, ()))
+            # Persist the 3:1 scheduling phase across small congestion windows.
+            selected = []
+            chat_index = file_index = 0
+            phase = self._schedule_phase
+            while chat_index < len(chats) or file_index < len(files):
+                if (phase == 3 and file_index < len(files)) or chat_index == len(chats):
+                    selected.append(files[file_index])
+                    file_index += 1
+                else:
+                    selected.append(chats[chat_index])
+                    chat_index += 1
+                phase = (phase + 1) % 4
             for key, item, source, destination in selected:
+                if len(plans) >= RETRANSMIT_BATCH:
+                    break
                 if server.pending.get(key) is not item:
                     continue
+                if not destination["congestion"].try_send(key[1], now):
+                    continue
+                self._schedule_phase = (self._schedule_phase + 1) % 4
                 server.pending.pop(key)
                 server.pending[key] = item
-                item["retry_time"] = now + RETRY_TIMEOUT
+                item["retry_time"] = now + max(
+                    RETRY_TIMEOUT, destination["congestion"].rto
+                )
                 item["attempts"] += 1
                 plans.append((key, item, source, destination))
         for key, item, source, destination in plans:

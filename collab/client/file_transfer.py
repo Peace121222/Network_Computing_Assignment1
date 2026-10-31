@@ -4,6 +4,7 @@ from collections import OrderedDict
 from collab.shared.limits import FILE_PROGRESS_INTERVAL
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import queue
@@ -24,7 +25,7 @@ from collab.shared.limits import (
     FILE_MAILBOX_LIMIT,
 )
 from collab.shared.protocol import b64, unb64, validate_udp
-from collab.transport.udp import encode_udp
+from collab.transport.udp import validate_udp_size
 
 MAX_INCOMING_TRANSFERS = 2
 MAX_INCOMING_BYTES = 50 * 1024 * 1024
@@ -629,20 +630,30 @@ class FileTransfers:
                     dict(start, **{"from": client.name, "token": client.token}),
                     from_client=True,
                 )
-                encode_udp(
-                    dict(start, **{"from": client.name, "token": client.token}),
-                    client.f,
+                relay_names = ([recipient] if recipient != "*" else client.names) + [
+                    "x" * 24
+                ]
+                relay_destination = max(
+                    relay_names, key=lambda name: len(json.dumps(name))
                 )
-                encode_udp(
+                validate_udp_size(
+                    dict(start, **{"from": client.name, "token": client.token})
+                )
+                relay_names = ([recipient] if recipient != "*" else client.names) + [
+                    "x" * 24
+                ]
+                relay_destination = max(
+                    relay_names, key=lambda name: len(json.dumps(name))
+                )
+                validate_udp_size(
                     dict(
                         start,
                         **{
                             "from": client.name,
-                            "to": "x" * 24,
+                            "to": relay_destination,
                             "meta": dict(meta, sender_session="0" * 32),
                         },
                     ),
-                    client.f,
                 )
                 client.send_packets(
                     [start], session=session, file_record=record, deadline=deadline

@@ -515,6 +515,12 @@ class AdmissionUnitTests(unittest.TestCase):
         self.assertEqual(len(self.server.pending), 2)
 
     def test_retransmission_batch_is_fair_and_send_does_not_hold_registry(self):
+        # A pre-opened congestion window isolates scheduler batching from startup.
+        from collab.transport.congestion import CubicController
+
+        congestion = CubicController(max_window=512, clock=lambda: 1)
+        congestion.cwnd = congestion._tokens = 512
+        self.server.users["bob"]["congestion"] = congestion
         self.server.max_pending_packets = self.server.max_pending_per_recipient = 300
         for index in range(260):
             msg = dict(

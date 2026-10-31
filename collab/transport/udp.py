@@ -69,6 +69,14 @@ def udp_frame_size(msg: dict[str, Any]) -> int:
     return 32 + encrypted_size(size)
 
 
+def validate_udp_size(msg: dict[str, Any]) -> None:
+    """Reject messages that exceed the session-framed UDP limit without encryption."""
+    _require(
+        udp_frame_size(msg) <= UDP_MTU,
+        "Encrypted UDP frame exceeds 1100 bytes; shorten the message or metadata",
+    )
+
+
 def encode_udp(msg: Any, f: Fernet, security: Channel | None = None) -> bytes:
     """Encode a message and enforce the encrypted datagram size limit.
 

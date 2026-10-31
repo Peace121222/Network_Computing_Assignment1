@@ -41,6 +41,7 @@ from collab.shared.limits import (
 )
 from collab.shared.protocol import validate_tcp, validate_udp
 from collab.shared.resilience import Cleanup, RetryDelay, SendBackoff, retryable
+from collab.transport.congestion import CubicController
 from collab.transport.handshake import server_login
 from collab.transport.security import Channel, nonce, unseal
 from collab.transport.tcp import TCPReader, frame_tcp, send_tcp
@@ -76,6 +77,8 @@ class Server:
         udp_port: int = 9001,
         *,
         database: str = "accounts.sqlite3",
+        auth_limit: int = 10,
+        auth_window: float = 60,
         certfile: str | None = None,
         keyfile: str | None = None,
         session_expiry: float = SESSION_EXPIRY,
@@ -91,6 +94,7 @@ class Server:
             session_check_interval,
             file_idle_timeout,
             file_transfer_timeout,
+            auth_window,
         ):
             if (
                 isinstance(value, bool)
@@ -99,7 +103,12 @@ class Server:
                 or value <= 0
             ):
                 raise ValueError("Session timing must be finite and positive")
-        for value in (max_connections, max_pending_packets, max_pending_per_recipient):
+        for value in (
+            max_connections,
+            max_pending_packets,
+            max_pending_per_recipient,
+            auth_limit,
+        ):
             if type(value) is not int or value <= 0:
                 raise ValueError("Resource limits must be positive integers")
         self.host, self.tcp_port, self.udp_port = host, tcp_port, udp_port
@@ -116,7 +125,7 @@ class Server:
         )
         self.database = database
         self.accounts = None
-        self.auth_limiter = AuthLimiter()
+        self.auth_limiter = AuthLimiter(limit=auth_limit, window=auth_window)
         self.tls_context = (
             server_context(certfile, keyfile) if certfile and keyfile else None
         )
@@ -832,6 +841,7 @@ class Server:
                     user = dict(
                         sock=conn,
                         cipher=Fernet(session_key),
+                        congestion=CubicController(),
                         token=token,
                         tcp_addr=conn.getpeername(),
                         udp_addr=None,
@@ -1074,6 +1084,8 @@ class Server:
                         item = self.pending.get(key)
                         if item is not None and item["destination_token"] == token:
                             del self.pending[key]
+                            if "congestion" in user:
+                                user["congestion"].acknowledge(msg["id"], now)
                             self._chat_outcome_locked(item, name, "delivered")
                             self.file_transfers.acknowledged(item, now)
         if expired:
@@ -1135,6 +1147,8 @@ def main() -> int:
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
     parser.add_argument("--database", default="accounts.sqlite3")
+    parser.add_argument("--auth-limit", type=int, default=10)
+    parser.add_argument("--auth-window", type=float, default=60)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     server = None
@@ -1145,6 +1159,8 @@ def main() -> int:
             args.tcp_port,
             args.udp_port,
             database=args.database,
+            auth_limit=args.auth_limit,
+            auth_window=args.auth_window,
             certfile=args.cert,
             keyfile=args.key,
         )

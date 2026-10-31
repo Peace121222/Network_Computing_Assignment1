@@ -5,7 +5,7 @@ import threading
 import time
 from collab.shared.limits import CHAT_OUTGOING_LIMIT, CHAT_CONFIRM_TIMEOUT
 from collab.shared.protocol import validate_udp
-from collab.transport.udp import encode_udp
+from collab.transport.udp import validate_udp_size
 
 
 class ChatSender:
@@ -45,7 +45,7 @@ class ChatSender:
         client = self.client
         raw = dict(packet, **{"from": client.name, "token": client.token})
         validate_udp(raw, from_client=True)
-        encode_udp(raw, client.f)
+        validate_udp_size(raw)
         names = (
             [n for n in client.names if n != client.name]
             if packet["to"] == "*"
@@ -65,7 +65,7 @@ class ChatSender:
                 },
             },
         )
-        encode_udp(forwarded, client.f)
+        validate_udp_size(forwarded)
 
     def chat(self, recipient, text):
         """Send chat and wait for the server's final recipient result.

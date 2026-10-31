@@ -407,6 +407,12 @@ class ChatServerTests(unittest.TestCase):
         self.assertEqual(len(self.server.pending), 8)
 
     def test_weighted_schedule_uses_96_chat_and_32_file_slots(self):
+        # A pre-opened congestion window isolates scheduler batching from startup.
+        from collab.transport.congestion import CubicController
+
+        congestion = CubicController(max_window=512, clock=lambda: 100)
+        congestion.cwnd = congestion._tokens = 512
+        self.server.users["bob"]["congestion"] = congestion
         for index in range(140):
             for kind in ("chat", "file_end"):
                 mid = kind + str(index)

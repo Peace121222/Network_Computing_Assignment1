@@ -94,6 +94,7 @@ def evidence(path):
         inventory=inventory,
         recorded=recorded,
         environment=field("Environment", "See the test log"),
+        source_snapshot=field("Source snapshot SHA256", "not recorded"),
     )
 
 
@@ -332,7 +333,52 @@ class Report:
         self.story.extend([table, Spacer(1, 6)])
 
 
+class StateDiagram(Diagram):
+    """Draw editable state transitions using the report's existing vector style."""
+
+    def __init__(self, states, transitions, return_label, terminal_failure=False):
+        self.states, self.transitions, self.return_label = (
+            states,
+            transitions,
+            return_label,
+        )
+        self.terminal_failure = terminal_failure
+        super().__init__(len(states) * 78 + 12)
+
+    def draw(self):
+        x, width = 95, 290
+        positions = []
+        for index, (name, detail) in enumerate(self.states):
+            y = self.height - 58 - index * 78
+            self.box(x, y, width, 43, [name, detail])
+            positions.append(y)
+            if index:
+                self.arrow(x + width / 2, positions[index - 1], x + width / 2, y + 43)
+                self.text(x + width / 2 + 80, y + 54, self.transitions[index - 1], 7)
+        if self.terminal_failure:
+            middle = (positions[0] + positions[-2]) / 2 + 20
+            self.box(0, middle - 22, 73, 44, ["FAILED /", "CANCELLED"])
+            for y in positions[:-1]:
+                self.canv.line(95, y + 20, 82, y + 20)
+            self.canv.line(82, positions[0] + 20, 82, positions[-2] + 20)
+            self.arrow(82, middle, 73, middle)
+        # A return path represents cleanup or the next transaction.
+        right = WIDTH - 15
+        bottom = positions[-1] + 20
+        top = positions[0] + 20
+        self.canv.setStrokeColor(BLUE)
+        self.canv.line(x + width, bottom, right, bottom)
+        self.canv.line(right, bottom, right, top)
+        self.arrow(right, top, x + width, top)
+        self.canv.saveState()
+        self.canv.translate(right - 5, (top + bottom) / 2)
+        self.canv.rotate(90)
+        self.text(0, 0, self.return_label, 7)
+        self.canv.restoreState()
+
+
 def populate(report, result):
+    """Build the current account/TLS/CUBIC report from verified test evidence."""
     r = report
     r.p("NETWORK APPLICATION DEVELOPMENT / ASSIGNMENT 1", "small")
     r.p("Technical Explanation<br/>Report", "title")
@@ -340,378 +386,347 @@ def populate(report, result):
         "<b>Distributed and Streaming-based Client-Server Collaboration Application</b>"
     )
     r.p(
-        f"Implementation: Collab LAN | Evidence recorded: {escape(result['recorded'])}",
+        f"Evidence: {escape(result['recorded'])} | {result['count']} tests | {escape(result['outcome'])}",
         "small",
     )
     r.h("1. Objective and system architecture")
     r.p(
-        "Collab LAN provides nickname login, live user discovery, private/broadcast chat, and reliable binary file transfer for a trusted LAN group. It uses Python raw TCP/UDP sockets, application-layer reliability, Fernet encryption, and a plain JavaScript browser interface. Core networking is separated from data processing and presentation."
+        "Collab LAN provides persistent username/password accounts, online discovery, private/broadcast chat, and reliable binary file transfer. Clients use raw TCP/UDP sockets; browsers use a local standard-library HTTP bridge. Network, application state, and user interface responsibilities remain separate."
     )
     r.story.append(Architecture())
     r.p(
-        "Figure 1. Browsers talk only to their local HTTP bridge. Client processes communicate with the relay over encrypted TCP and UDP. Arrows identify connection paths; both transports exchange traffic in both directions. A CLI can replace the browser/HTTP bridge.",
+        "Figure 1. Each browser communicates with its own loopback HTTP backend. Client processes connect to the relay using verified TLS/TCP control and encrypted UDP data. The server decrypts source content and encrypts it for the destination; this is not end-to-end encryption.",
         "small",
     )
-    r.h("Transport responsibilities")
+    r.h("Transport interpretation")
     r.p(
-        "<b>TCP:</b> encrypted login, session control, large presence snapshots, and final chat/file results. <b>UDP:</b> encrypted heartbeat, path verification, presence, chat/file payloads, and per-hop ACK/retry. The relay sees application contents; this is not end-to-end encryption between clients."
-    )
-    r.p(
-        f"<b>Verified snapshot:</b> {result['count']} tests completed with {escape(result['outcome'])}; includes 20 simultaneous clients. This is functional localhost evidence, not a WAN throughput or congestion-control benchmark."
+        "The assignment's goal and file-transfer rubric require UDP streaming and reassembly; its technology overview also mentions TCP reliable transfer. This project uses TCP for TLS authentication/control/results and UDP for application payloads, discovery, and ACK/retry. Presence broadcast is server fan-out, not LAN broadcast autodiscovery. These two interpretations are documented as instructor questions in docs/ASSIGNMENT_CLARIFICATIONS.md; no instructor approval is claimed."
     )
 
-    r.page(2, "2. Modular implementation and concurrency")
+    r.page(2, "2. Architecture, concurrency, and resource ownership")
     r.table(
-        ["Package / entry point", "Responsibility"],
+        ["Module", "Responsibility"],
         [
             (
-                "collab/client/",
-                "core.py owns sockets and lifecycle; cli.py owns terminal commands and exit handling; chat_sender.py waits for delivery results; chat_inbox.py handles per-stream ordering; file_transfer.py streams and verifies files.",
+                "client/",
+                "Session lifecycle, terminal menu/commands, bounded chat ordering, outgoing confirmation and file/disk workers.",
             ),
             (
-                "collab/server/",
-                "core.py manages sessions, bounded connections and supervision; routing.py handles chat admission/retries; file_transfers.py tracks fixed recipient sessions and file results.",
+                "server/",
+                "Account admission, session registry, per-session TCP writers, relay queues and recipient-confirmed file outcomes.",
             ),
             (
-                "collab/transport/",
-                "tcp.py provides persistent framing/deadlines; udp.py provides size-aware encoding; security.py owns authenticated envelopes/replay state; handshake.py binds login to fresh nonces.",
+                "transport/",
+                "TLS contexts, account handshake, TCP frames, encrypted UDP envelopes and path-local CUBIC controllers.",
             ),
             (
-                "collab/shared/",
-                "protocol.py validates business messages; limits.py defines protocol defaults; concurrency.py provides bounded pools; resilience.py handles retry/backoff and independent cleanup.",
+                "shared/",
+                "Schemas, limits, bounded worker pools, retry/backoff and independent cleanup.",
             ),
             (
-                "collab/web/",
-                "handlers.py serves JSON and fixed static routes; static/index.html, style.css and app.js contain the frontend; runtime.py bounds work; cli.py starts the interface.",
+                "accounts.py / certgen.py",
+                "Parameterized SQLite account operations, Argon2id hashes, bounded authentication policy, and a local CA/server certificate generator.",
             ),
             (
-                "Compatibility modules",
-                "common.py re-exports shared APIs and shutdown/control defaults. webui.py retains PAGE and the web command; core.main() lazily forwards to client.cli. Package entry points preserve python -m commands.",
+                "web/",
+                "Loopback HTTP requests call the same client core; JavaScript renders online users, messages and per-transfer progress.",
             ),
         ],
-        [137, WIDTH - 137],
+        [135, WIDTH - 135],
     )
-    r.h("Worker ownership")
+    r.h("Workers and locks")
     r.p(
-        "The server has five critical loops: accept, UDP receive, retransmission, session expiry, and presence. One supervisor coordinates fatal-worker shutdown. Each accepted connection has a tracked handler; each logged-in session has a TCP writer with bounded control/chat/file mailboxes. Sockets are registered before handlers start."
-    )
-    r.p(
-        "A connected client has TCP receive, UDP receive, heartbeat, and file/disk workers. Slow writes and hashing run in the file worker rather than the UDP listener. HTTP adds two send workers plus four waiting slots, two upload slots, and eight handler workers with capacity for 16 admitted connections."
-    )
-    r.h("Lock and resource boundaries")
-    r.p(
-        "Registry locks protect short state changes. Encoding, network sends, disk I/O, and joins run outside the global server lock. UDP session gates are acquired in token order, with session identity checked again before sending. Startup gates prevent workers processing partially initialized sessions. Cleanup uses a shared 3-second deadline and retains unfinished resources for a later retry."
+        "Server workers accept TCP, receive UDP, schedule relay retries, expire sessions, and publish presence. A supervisor owns fatal-worker cleanup; each session has a TCP handler and writer. Clients own TCP receive, UDP receive, heartbeat, and receive-disk workers. HTTP has two send workers/four waiting slots, two upload slots, and eight handlers/sixteen admitted connections."
     )
     r.p(
-        "Source: collab/server/core.py; collab/client/core.py; collab/web/runtime.py; collab/shared/concurrency.py.",
-        "small",
+        "Registry locks protect short state changes. Session gates are acquired in token order; socket sends and joins occur outside the server registry lock. CUBIC state has its own lock and never sleeps or calls back into application locks. The receive worker owns temporary streams; cleanup retains unfinished resources for retry within a shared shutdown deadline."
+    )
+    r.h("Production configuration and scaling")
+    r.p(
+        "Defaults remain 64 TCP connections, 8,192 pending packets, and 1,024 pending packets per recipient. Authentication permits ten attempts per source IP per 60 seconds. The 20-user same-IP demonstration explicitly starts the production Server with auth_limit=60 (CLI --auth-limit 60), covering twenty registrations plus twenty logins without a test-subclass override. The default security policy is tested separately and is not silently disabled."
     )
 
     r.page(3, "3. Application protocol specification")
     r.table(
-        ["Message / transport", "Payload and purpose"],
+        ["Message / transport", "Fields and purpose"],
         [
             (
-                "hello / challenge (TCP)",
-                "hello: client_nonce. challenge: client_nonce + server_nonce. Each nonce contains 32 random bytes encoded as 64 hex characters.",
+                "register / registered (TLS TCP)",
+                "Request: name, password. Success: type=registered, then connection closes. Registration returns to the terminal menu; it does not create an online session.",
             ),
             (
-                "login / welcome (TCP)",
-                "login: name and both nonces. welcome: token, udp_port, session and both nonces. The public session context differs from the secret authorization token.",
+                "login / welcome (TLS TCP)",
+                "Request: name, password. Welcome: token, session, key, udp_port. Keys and identifiers are freshly random; credentials are not command-line arguments.",
             ),
             (
                 "error / logout / users (TCP)",
-                "error carries a bounded message; logout ends the session. Server users responses carry names[] and nonnegative revision.",
+                "Bounded error message; logout ends the session. Users carries names[] and revision. Established controls also use an ordered session envelope inside TLS.",
             ),
             (
-                "chat_status (TCP)",
-                "id, state (delivered/failed/rejected), original recipients[], delivered[], failures[{name, reason}].",
-            ),
-            (
-                "File control (TCP)",
-                "file_status reports accepted/final results. file_receipt confirms recipient saving or failure; file_abort and file_cancel terminate transfer work.",
+                "chat_status / file controls (TCP)",
+                "Final recipients, delivered names and failure reasons. file_receipt confirms successful save/hash verification; abort/cancel retire outstanding work.",
             ),
             (
                 "heartbeat / presence (UDP)",
-                "Client packets carry from + token. Server presence carries sorted names[] + revision; clients ignore older revisions.",
+                "Client from+token; server names[]+revision. Verified application activity refreshes liveness; older presence revisions are ignored.",
             ),
             (
-                "path_challenge / response (UDP)",
-                "A nonce proves that a new candidate endpoint can receive and answer an authenticated challenge before registration.",
+                "path_challenge / path_response (UDP)",
+                "A fresh nonce and candidate endpoint must match before adopting a changed UDP address. Path checks alone do not extend heartbeat life.",
             ),
             (
                 "data/chat (UDP)",
-                "id, from, to, kind, payload, meta. Forwarded metadata adds sender_session, original channel and per-recipient stream sequence.",
+                "id, from, to, kind, payload, meta. Relay metadata includes sender_session, original channel and stream sequence.",
             ),
             (
-                "data/file_start (UDP)",
-                "meta: transfer, filename, size, count, sha256; forwarded packets also include sender_session.",
-            ),
-            (
-                "data/file_chunk / end (UDP)",
-                "chunk: transfer + index and base64 payload. end: transfer and empty payload. Receiver checks chunk length against declared file size.",
+                "file_start / chunk / end (UDP)",
+                "Start: transfer, filename, size, count, sha256. Chunk: transfer/index/base64 bytes. End: transfer and empty payload. Forwarded packets include sender_session.",
             ),
             (
                 "ack (UDP)",
-                "id identifies a hop-local packet. Client ACKs also carry from + token. Server-to-client payloads do not expose authorization tokens.",
+                "Hop-local application ID; client ACKs include from+token. New ACKs release congestion flight and update the sending hop's controller.",
             ),
         ],
         [145, WIDTH - 145],
     )
-    r.h("Framing and validation")
+    r.h("Framing and size checks")
     r.p(
-        f"Business payloads are compact UTF-8 JSON objects. TCP carries a 4-byte big-endian ciphertext length followed by a Fernet token. Its JSON payload limit remains {limits.MAX_FRAME:,} bytes, with a separately computed ciphertext ceiling. UDP carries one Fernet token per datagram, at most {limits.UDP_MTU:,} bytes including encryption overhead; a raw file chunk is {limits.CHUNK} bytes."
-    )
-    r.p(
-        "TCPReader preserves partial headers/bodies across timeout and reads only missing bytes. EOF mid-frame, invalid lengths, authentication failure or malformed JSON terminate that connection. UDP is authenticated and schema-checked before replay state, endpoint, liveness or application state can change. Invalid packets receive no ACK."
-    )
-    r.p(
-        "Source: collab/shared/protocol.py; collab/transport/tcp.py; collab/transport/udp.py.",
-        "small",
+        f"JSON is compact UTF-8. TCP uses a four-byte big-endian length; authentication JSON is protected by TLS and capped at 2,048 bytes. Established JSON is capped at {limits.MAX_FRAME:,} bytes before envelope encoding. UDP includes a 32-byte public context lookup prefix plus a Fernet token and is limited to {limits.UDP_MTU} bytes. File chunks are {limits.CHUNK} raw bytes. Chat and file preflight now use the same session-framed size calculation as the relay, preventing the previously accepted oversized boundary case."
     )
 
-    r.page(4, "4. Security Envelope and anti-replay window")
+    r.page(4, "4. Account security and authenticated envelopes")
     r.p(
-        f"The authenticated plaintext is a {HEADER.size}-byte binary header followed by compact JSON. Fernet encrypts and authenticates both together. The header is <b>inside</b> the Fernet token; it is not an unauthenticated routing prefix."
+        "Clients load an explicit CA and verify the server DNS/IP SAN before sending credentials. TLS 1.2 or later protects the entire TCP connection; there is no insecure bypass. SQLite stores id, unique case-sensitive username, Argon2id password_hash, and created_at. Policy: 8-128 password characters, random library-managed salts, 19 MiB memory, two iterations and parallelism one. Four hashing jobs and bounded login frames/deadlines limit unauthenticated work."
+    )
+    r.p(
+        "A valid password is checked before the server reports an already-online account. Username reservation is atomic. Each login receives a random Fernet key, public session context and separate authorization token. The key is not derived from the password/hash and is never stored in SQLite or printed. COLLAB_KEY and the legacy nonce handshake are not login mechanisms in this protocol version."
     )
     r.code(
-        "wire TCP = uint32_be(token_length) || Fernet(header || JSON)\nwire UDP = Fernet(header || JSON)\nheader format = !B16sBBQ   (network byte order)"
+        "auth TCP = TLS(uint32_be(length) || JSON)\ncontrol TCP = TLS(uint32_be(length) || Fernet(header || JSON))\nUDP = public_context_hex[32] || Fernet(header || JSON)\nheader = !B16sBBQ"
     )
     r.story.append(Envelope())
-    r.table(
-        ["Field", "Validation / meaning"],
-        [
-            (
-                "Version (1 byte)",
-                f"Must equal {VERSION}; no downgrade to legacy plaintext or old UDP JSON framing.",
-            ),
-            (
-                "Context (16 bytes)",
-                "All-zero context during nonce-bound handshake; a new public session UUID after welcome. It is separate from the authorization token.",
-            ),
-            (
-                "Direction (1 byte)",
-                "1 = client-to-server; 2 = server-to-client. Reflected frames in the wrong direction are rejected.",
-            ),
-            (
-                "Transport (1 byte)",
-                "1 = TCP; 2 = UDP. A frame cannot be reused across transports.",
-            ),
-            (
-                "Sequence (8 bytes)",
-                "Unsigned integer from 1 to 2^64 - 1. Separate send/receive state per channel, direction and session. Exhaustion is an explicit error.",
-            ),
-        ],
-        [130, WIDTH - 130],
-    )
-    r.h(f"Bounded UDP replay window: {REPLAY_WINDOW:,} sequence numbers")
     r.p(
-        "The receiver keeps a highest sequence number and a 4,096-bit bitmap. A higher sequence shifts the bitmap, marks the new sequence and discards bits outside the window. A large jump clears the window before marking the newest packet. An older sequence is accepted only if it remains within the window and its bit is unset. Duplicate and out-of-window packets are dropped without ACK or liveness refresh."
-    )
-    r.code(
-        "receive: 3 -> accept; 1 -> accept; 2 -> accept; 1 -> reject\nreceive: 4099 -> accept; 3 -> reject (distance = 4096)"
-    )
-    r.p(
-        "For UDP, schema, session, direction and transport checks precede replay-state commitment. Each actual UDP retry uses a fresh security sequence while retaining the application ID, so application deduplication can ACK a legitimate retry without displaying it twice. TCP instead requires exactly the next sequence number. Counters are reset for every new session."
-    )
-    r.p(
-        "<b>Trust boundary:</b> one COLLAB_KEY is shared by the group. Key holders can decrypt and forge group traffic; there is no per-user cryptographic identity, TLS or forward secrecy. Replay protection does not detect every valid packet withheld before first delivery. Fernet timestamps are not used as the main freshness check, avoiding a wall-clock synchronization dependency.",
+        f"Figure 2. The {HEADER.size}-byte encrypted header binds version {VERSION}, 16-byte session context, direction, TCP/UDP transport, and sequence. The outer UDP prefix is only a cipher lookup hint; the inner context must still authenticate.",
         "small",
     )
+    r.h("Replay, endpoint and cleanup boundaries")
+    r.p(
+        f"TCP requires the next sequence. UDP uses a {REPLAY_WINDOW:,}-packet replay bitmap. Every actual retry retains its application ID but uses a fresh security sequence, allowing legitimate deduplication without accepting replayed frames. UDP schemas and session credentials are checked before endpoint/liveness updates. A challenge response proves endpoint reachability. Logout, TCP loss, heartbeat expiry, and interrupts retire session references; Python cannot promise physical key-memory erasure. TLS plus a trusted CA prevents an old welcome from authenticating a new TLS connection."
+    )
 
-    r.page(5, "5. Login, endpoint validation and presence")
+    r.page(5, "5. Authentication and data lifecycles")
     r.story.append(
         Sequence(
             ["Client", "Server"],
             [
-                (0, 1, "TCP connect"),
-                (0, 1, "hello(client_nonce) [encrypted]"),
-                (1, 0, "challenge(client_nonce, server_nonce)"),
-                (0, 1, "login(name, both nonces)"),
-                (1, 0, "welcome(token, udp_port, session, both nonces)"),
+                (0, 1, "TCP + verified TLS handshake"),
+                (0, 1, "register(name,password) [optional new account]"),
+                (1, 0, "registered; close; return to terminal menu"),
+                (0, 1, "new verified TLS + login(name,password)"),
+                (1, 0, "welcome(token,session,key,udp_port)"),
                 (0, 1, "UDP heartbeat from candidate endpoint"),
                 (1, 0, "path_challenge(nonce)"),
-                (0, 1, "path_response(nonce)"),
-                (0, 1, "fresh heartbeat from verified endpoint"),
-                (1, 0, "presence(names, revision)"),
+                (0, 1, "path_response(nonce), then fresh heartbeat"),
+                (1, 0, "presence(names,revision)"),
             ],
         )
     )
     r.p(
-        "Figure 2. All messages after TCP connect are protected. Fresh nonces bind a login/welcome exchange to this attempt; old login/welcome ciphertext cannot complete a new handshake. After welcome, both ends switch to the new session context and reset channel counters.",
+        "Figure 3. Registration and login are separate TLS connections. Passwords are entered only in the terminal. The Web HTTP listener opens only after successful login. Client connected status follows local UDP setup and worker startup; it does not itself prove path reachability.",
         "small",
     )
-    r.h("Deadlines and initialization")
-    r.p(
-        f"TCP establishment allows {limits.CONNECT_TIMEOUT} seconds; the complete client handshake has {limits.CLIENT_LOGIN_TIMEOUT} seconds, and the server has {limits.LOGIN_TIMEOUT} seconds from accept. These are monotonic total deadlines, so drip-fed bytes do not extend them. Username registration is atomic. Server ready is set only after welcome and writer startup; clients become connected after local UDP setup, first heartbeat send, and worker startup. Connected does not guarantee UDP reachability."
-    )
-    r.h("Path verification and session expiry")
-    r.p(
-        "A new UDP source address does not immediately replace the verified endpoint. One candidate per session holds a random challenge for 2 seconds; new challenges are rate-limited to one per 0.5 seconds. A matching response must come from that candidate before expiry. Path control alone never refreshes liveness; the old endpoint remains usable until replacement succeeds."
-    )
-    r.p(
-        f"Valid business UDP activity refreshes last_seen. After {limits.SESSION_EXPIRY} seconds without it, expiry closes TCP and removes the session; checks run every {limits.SESSION_CHECK_INTERVAL} seconds. Logout/EOF/errors use the same session-identity-safe cleanup. Revision increases on online membership changes, not endpoint changes. Heartbeats recover presence; snapshots above the UDP ceiling use TCP users."
-    )
-
-    r.page(6, "6. Message and file-transfer lifecycles")
-    r.h("Chat: hop ACK versus application acceptance")
+    r.h("Chat and file sequence")
     r.story.append(
         Sequence(
             ["Sender", "Relay", "Recipient"],
             [
-                (0, 1, "data/chat(id)"),
-                (1, 0, "ingress ACK"),
-                (1, 2, "forwarded chat + stream sequence"),
-                (2, 1, "ACK after buffer/event admission"),
-                (1, 0, "TCP chat_status(final result)"),
+                (0, 1, "data/chat or file_start/chunk/end + ID"),
+                (1, 0, "ingress ACK after bounded admission"),
+                (1, 2, "CUBIC-admitted, per-recipient encrypted data"),
+                (2, 1, "ACK after buffer/job admission"),
+                (2, 1, "file_receipt after SHA-256 + saving"),
+                (1, 0, "final chat_status / file_status"),
             ],
         )
     )
     r.p(
-        "The relay caches source-session + ID, normalized content and a fixed recipient-session set. Retries cannot add recipients or change content. A recipient ACK follows valid buffer/event admission; it does not imply a human has read the message. Streams buffer up to 64 messages, wait at most 1 second for a gap, then report the gap and advance without blocking other streams. Server delivery deadline: 5 seconds; sender confirmation deadline: 10 seconds."
-    )
-    r.h("Files: verified disk saving before final success")
-    r.story.append(
-        Sequence(
-            ["Sender", "Relay", "Recipient"],
-            [
-                (0, 1, "file_start(size, count, SHA-256)"),
-                (1, 2, "file_start + sender_session"),
-                (0, 1, "file_chunk(index, base64) + retry"),
-                (1, 0, "UDP ingress ACK"),
-                (1, 2, "file_chunk(index, base64)"),
-                (2, 1, "UDP ACK after queue admission"),
-                (0, 1, "file_end"),
-                (1, 2, "file_end"),
-                (2, 1, "TCP file_receipt(saved or failed)"),
-                (1, 0, "TCP file_status(final result)"),
-            ],
-        )
-    )
-    r.p(
-        "Figure 3. ACKs exist on both UDP hops; the diagram groups repeated chunk/ACK exchanges. Sender hashing and reads are streamed. The recipient's file worker seeks/writes a temporary file by chunk index, verifies SHA-256 by streaming reads, and renames only if the local session still matches. Empty files are supported. file_complete is local receive success; file_sent follows successful final recipient receipts, not relay ingress."
-    )
-    r.p(
-        "The source waits for all original recipients; partial failures include delivered/failed names. Pending packets retain source/destination session tokens internally and are removed on session end. The UI exposes separate send/receive progress with transfer identity; 100% chunk progress still waits for saving/recipient confirmation.",
+        "Figure 4. Each UDP data hop has independent congestion state. Hop ACKs indicate admission, not a human read or saved file. Final file success requires verification/save receipts from the original recipients. Sender and recipient sessions are pinned so a replacement login cannot inherit old work.",
         "small",
     )
 
-    r.page(7, "7. Challenges and solutions")
-    r.h("Keeping modular boundaries while preserving commands")
-    r.p(
-        "The initial single-file client/server layout mixed socket ownership, routing and UI concerns. Packages now separate transport/security, shared validation, client chat/file services, server routing and the HTTP bridge. Compatibility exports and package entry points retain existing imports and commands. Timing defaults are centralized in shared/limits.py. Public interfaces have Python 3.10+ annotations; caller-held-lock and cleanup invariants document the existing model. External CSS/JS preserve UI behavior, and a lazy core.main() wrapper avoids a CLI/core import cycle."
+    r.page(6, "6. Explicit state-transition diagrams")
+    r.h("Client lifecycle")
+    r.story.append(
+        StateDiagram(
+            [
+                ("DISCONNECTED", "initial state; menu or cleaned resources"),
+                ("CONNECTING", "verified TLS, login, UDP setup, workers"),
+                ("CONNECTED", "chat/file work; heartbeat and receive loops"),
+            ],
+            ["connect(password)", "welcome + local startup"],
+            "logout / failure / expiry -> cleanup",
+        )
     )
-    r.h("Timeouts without corrupting a byte stream")
     r.p(
-        "A TCP timeout may occur after part of a header or body has arrived. Restarting an ad-hoc reader would lose framing. One persistent TCPReader retains those bytes and bounds each recv to missing data. Total monotonic handshake deadlines stop silent/drip clients. Post-login poll timeouts preserve state; malformed frames fail closed instead of attempting stream resynchronization."
+        "Figure 5. Actual Client.status values are disconnected, connecting and connected. Startup failure also returns from connecting to disconnected. TLS/authentication are internal connecting stages; cleanup has no separately published closing status.",
+        "small",
     )
-    r.h("Reliability without duplicate delivery or stale-session leakage")
-    r.p(
-        "Security counters and application IDs serve different purposes. Retries receive a new authenticated counter but keep their application ID. Routing caches pin original recipients and compare content; destination-session checks prevent retries reaching a new login under the same nickname. Chat ACK follows admission, while a file's final result requires verified saving. Bounded per-stream gap waiting avoids one conversation blocking another."
+    r.h("Server lifecycle")
+    r.story.append(
+        StateDiagram(
+            [
+                ("STOPPED", "no active listeners/workers"),
+                ("STARTING", "database, TCP/UDP bind, worker gate"),
+                ("RUNNING", "accept, relay, presence, expiry"),
+                ("STOPPING", "signal, close sessions, join, retry cleanup"),
+            ],
+            ["start()", "startup succeeds", "close() / fatal worker"],
+            "cleanup succeeds; failed startup also rolls back",
+        )
     )
-    r.h("Disk and network work must not block shared workers")
     r.p(
-        "The UDP listener retains valid chunks in a bounded queue; the file worker writes/hashes outside the state lock. Queue admission precedes ACK, so rejected work can retry. Per-session TCP writers bound slow-reader effects. Global pending limits reserve chat capacity, and batches prefer 96 chat / 32 file packets out of 128, with unused slots redistributed and rotation within groups."
-    )
-    r.h("Authenticated traffic still needs replay and path checks")
-    r.p(
-        "Encryption alone did not stop a captured heartbeat refreshing an active session or changing its endpoint. The authenticated context/direction/transport fields, bounded replay bitmap and endpoint challenge now make these separate checks explicit. Client UDP also verifies the actual server IP/advertised UDP port. These mechanisms protect against outsiders; possession of the group key still grants group-wide trust."
-    )
-    r.h("Cleanup must remain independent under failure")
-    r.p(
-        "Critical server workers report the first error to a supervisor rather than joining one another. Handler/writer errors close only their own session. Cleanup attempts socket shutdown, queued-work cancellation, temporary-file cleanup and joins even if another step fails, using one deadline. EINTR/EAGAIN retry and interruptible UDP backoff avoid busy loops; incomplete resources stay tracked and block unsafe restart."
+        "Figure 6. Incomplete cleanup retains stopping status and blocks unsafe restart. These diagrams document the current implementation; they do not claim historical creation before the original code.",
+        "small",
     )
 
-    r.page(8, "8. Test evidence and validation boundaries")
+    r.page(7, "7. File transaction states and CUBIC")
+    r.story.append(
+        StateDiagram(
+            [
+                ("RECEIVING", "file_start admitted; temporary receive state"),
+                ("WRITING", "bounded chunk jobs; indexed disk writes"),
+                ("VERIFYING", "file_end + every chunk written; SHA-256"),
+                ("SAVED / RECEIPT", "rename, file_complete, final TCP receipt"),
+            ],
+            ["chunk admission", "all data + end", "size/hash match"],
+            "new transaction requires file_start",
+            terminal_failure=True,
+        )
+    )
     r.p(
-        f"<b>Recorded run:</b> {result['count']} tests in {result['seconds']} seconds; <b>{escape(result['outcome'])}</b>. Environment: {escape(result['environment'])}. Recorded UTC: {escape(result['recorded'])}."
+        "Figure 7. Conceptual receive states are represented by existing ended/finalizing/cancelled flags and job records, not new enum values. Unknown transfers are not ACKed. Duplicate chunks are fingerprint-checked. An active-session failure queues a failed receipt; session cancellation cleans up owned work.",
+        "small",
+    )
+    r.h("Application-level CUBIC on both UDP hops")
+    r.p(
+        "Each client session and each server destination session owns a bounded CUBIC controller shared by concurrent application data sends. It uses C=0.4 and beta=0.7, Reno slow start, a cubic epoch with Reno-friendly growth, and fast convergence. Three later ACKs mark a missing flight for fast retransmission; timeout restarts cwnd at one and increases the bounded RTO. First-send RTT samples update smoothed RTT/variation; retransmissions do not supply RTT samples (Karn's rule)."
+    )
+    r.p(
+        "A token bucket limits the average send budget using cwnd/RTT with at most one window per burst. Heartbeats, ACKs and path controls bypass the data window so congestion cannot deadlock control traffic. Client application batches still cap each call at six packets; the independent server relay window can grow up to 128. This is an application-datagram adaptation of CUBIC, not a claim of complete TCP/QUIC conformance: ECN, HyStart++, TCP SACK recovery and spurious-loss undo are absent."
+    )
+    r.p(
+        "Algorithm reference: RFC 9438, sections 4.2-4.10. https://www.rfc-editor.org/rfc/rfc9438.html. Source: collab/transport/congestion.py.",
+        "small",
+    )
+
+    r.page(8, "8. Challenges and solutions")
+    for title, text in [
+        (
+            "Confidential credentials without losing raw sockets",
+            "The former group-key nickname exchange could not establish individual identity. TLS now authenticates the server before credential transfer; SQLite and Argon2id preserve accounts without retaining plaintext passwords. Per-session keys isolate relay envelopes while retaining existing replay/path checks.",
+        ),
+        (
+            "Reliable transfer without blocking unrelated streams",
+            "One persistent TCP reader preserves fragmented frames across timeouts. UDP data admission and receive-disk work are separate; indexed temporary-file writes handle reordered chunks. Per-chat-stream gap handling bounds waiting without freezing other conversations. Slow-disk and dropped-ACK regression tests check those boundaries, rather than claiming all head-of-line delay disappears.",
+        ),
+        (
+            "Real congestion feedback rather than a fixed retry loop",
+            "CUBIC state tracks flight, ACKs, loss, RTT, RTO and pacing for both data hops. Window reservation precedes sends; rejected admission consumes neither a retry attempt nor another queue slot. A persistent 3:1 scheduling phase lets files progress even when a small shared destination window limits a batch.",
+        ),
+        (
+            "Size accounting must include the actual wire format",
+            "The old preflight measured an unprefixed token and could accept a 511-character chat whose relay frame was 1,112 bytes. Preflight now includes the public session prefix and forwarded metadata, matching the 1,100-byte wire ceiling before admission.",
+        ),
+        (
+            "A scalable demo must declare its authentication budget",
+            "Twenty users on one source IP require forty registration/login requests. A documented --auth-limit 60 setting enables that demonstration; default ten-per-minute behavior remains separately verified. Production scale tests use the real Client and Server classes, not relaxed fixture subclasses.",
+        ),
+        (
+            "Cleanup is independent of another cleanup failure",
+            "Session identities pin outstanding work; cancellation releases congestion flight. Supervisors signal before joining. Socket shutdown, worker pools, file cleanup and joins share bounded deadlines and retain failed resources for retry. No automatic reconnect silently recreates credentials or keys.",
+        ),
+    ]:
+        r.h(title)
+        r.p(text)
+
+    r.page(9, "9. Test evidence and verification boundaries")
+    r.p(
+        f"Recorded run: <b>{result['count']} tests</b> in {escape(result['seconds'])} seconds; <b>{escape(result['outcome'])}</b>. Environment: {escape(result['environment'])}. Recorded UTC: {escape(result['recorded'])}."
     )
     r.code("python -m unittest discover -s tests -v")
-    descriptions = {
-        "test_protocol": "Framing, schema, sizes, Unicode and invalid payload rejection",
-        "test_handshake": "Partial frames, total deadlines, initialization and rollback",
-        "test_sessions": "Tokens, expiry, endpoint changes, presence and session isolation",
-        "test_concurrency": "20 simultaneous clients, capacity, startup/shutdown and slow peers",
-        "test_chat": "Fixed recipients, ACK loss, ordering, gaps, limits and delivery results",
-        "test_files": "Streaming, SHA-256, empty files, partial failures, retries and cleanup",
-        "test_resilience": "Worker failure supervision, CLI errors, subprocess death and deadlines",
-        "test_security": "Encrypted envelopes, replay, wrong keys, nonce/path checks and rollback",
-        "test_web_concurrency": "HTTP admission, upload ownership, cancellation and pool cleanup",
-        "test_web_ui": "HTTP messages/presence/progress, static MIME/routes and JavaScript rendering",
-        "test_refactoring": "CLI import/legacy entry, timing aliases, annotations and static loading",
-        "test_integration": "Real encrypted sockets, unicast/broadcast, file hash and invalid UDP",
-    }
+    r.p(
+        "Test-run source snapshot SHA-256: " + escape(result["source_snapshot"]),
+        "small",
+    )
     r.table(
-        ["Test module", "Tests", "Evidence covered"],
+        ["Test module", "Count", "Evidence"],
         [
             (
                 name.removeprefix("test_"),
-                str(count),
-                descriptions.get(name, "See test source"),
+                count,
+                {
+                    "test_congestion": "Deterministic window/RTT/loss/idle behavior and framing regression.",
+                    "test_production_scale": "Real TLS accounts and 20 clients under explicit production configuration.",
+                    "test_accounts": "Persistence, password policy, races, TLS trust, rate windows and terminal flow.",
+                    "test_concurrency": "Bounded pools, 20 clients, scheduler fairness, slow workers and cleanup.",
+                    "test_files": "Chunks, hashes, receipts, reordering, loss, disk failure and streamed source limits.",
+                    "test_chat": "Broadcast/private results, ordering, missing ACKs and concurrent files.",
+                    "test_handshake": "Partial frames, deadlines, silent peers and startup rollback.",
+                    "test_integration": "Real encrypted TCP/UDP private/broadcast and binary/empty files.",
+                    "test_security": "Session/channel binding, replay windows, path verification and stale packets.",
+                    "test_sessions": "Presence, expiry, disconnect/relogin and endpoint lifecycle.",
+                    "test_web_ui": "HTTP/static routes, progress and JavaScript rendering.",
+                    "test_web_concurrency": "Upload/send admission, cancellation and local HTTP cleanup.",
+                    "test_protocol": "Wire schemas, invalid payloads, Unicode and boundary sizes.",
+                    "test_refactoring": "Compatibility, CLI flags, certificate generation and source grammar.",
+                    "test_resilience": "Killed processes, worker exceptions, deadlines and cleanup retries.",
+                }.get(name, "Behavioral regression tests."),
             )
-            for name, count in result["inventory"].items()
+            for name, count in sorted(result["inventory"].items())
         ],
-        [105, 40, WIDTH - 145],
-    )
-    r.h("What these tests demonstrate")
-    r.p(
-        "The 20-client test uses barriers to race login, unicast/broadcast and close, comparing exact content and receiver counts. Socket localhost tests combine with fake clocks, Events, Barriers and injected errors for deterministic failure boundaries. The invalid-UDP integration case uses a valid security envelope and observes actual schema rejection, rather than passing only because a legacy envelope was rejected."
+        [104, 48, WIDTH - 152],
     )
     r.p(
-        "Static-route tests verify exact resource bytes, MIME types and allowlisted paths. Import tests cover both CLI/core orders, loading from another working directory and clear failure when resources are missing. The JavaScript test requires Node.js and is explicitly skipped if unavailable; browser HTTP integration remains Python-based. Failure-injection cases intentionally log tracebacks, so the final unittest summary and exit code determine success. Test counts are checked against the current source inventory whenever this report is generated."
-    )
-    r.p(
-        "The current evidence does not establish Windows/Linux execution, physical-LAN firewall behavior, WAN performance, or broad loss/latency benchmarks. A 20-client functional scenario is not a throughput claim. Detailed output: docs/test_results.txt.",
+        "Localhost regression tests use OS-assigned ports, temporary databases/certificates/files, fake clocks and controlled loss/error injection. They do not establish WAN fairness or throughput. The separately recorded terminal/LAN-interface demo and its exact scope are in docs/demo_results.txt. A local interface test is not evidence of a second physical device. Windows/Linux execution and instructor approval remain external verification tasks.",
         "small",
     )
 
-    r.page(9, "9. Limits, reproduction and submission")
+    r.page(10, "10. Reproduction, limits, and open interpretation questions")
+    r.code(
+        "python3 -m venv .venv\nsource .venv/bin/activate\npython -m pip install -r requirements.txt\npython -m collab.certgen --out certs --names localhost 127.0.0.1\n# Server (one terminal)\npython -m collab.server --cert certs/server.crt --key certs/server.key\n# Alice and Bob (separate terminals; register, then log in)\npython -m collab.webui --name alice --ca certs/ca.crt --web-port 8080\npython -m collab.webui --name bob --ca certs/ca.crt --web-port 8081"
+    )
+    r.p(
+        "For a 20-user same-IP demonstration, add --auth-limit 60 to the server. For LAN, include the actual server IP in certificate SANs, bind --host 0.0.0.0, securely distribute only ca.crt, and set each client's --host to that IP. HTTP stays on client loopback. The README contains full download-directory and CLI examples."
+    )
     r.table(
-        ["Default / boundary", "Current behavior"],
+        ["Boundary", "Current limit"],
         [
             (
-                "File and receive limits",
-                "25 MiB/file; 320-byte chunks; two outgoing and two incoming files per client; 50 MiB total declared incoming size. File write queue: 256 jobs.",
+                "Files",
+                "25 MiB/file; two incoming and two outgoing; 50 MiB declared incoming total; receive job queue 256.",
             ),
             (
-                "Server admission",
-                "64 TCP connections including handshake; 8,192 pending packets total; 1,024 per recipient. Limits are configurable keyword-only constructor parameters.",
+                "Congestion",
+                "CUBIC flight limit 128 datagrams/path; initial window two; RTO 0.05-2 seconds, plus the application's minimum retry interval.",
             ),
             (
-                "Retry and resource bounds",
-                "Client window: 6 packets; client attempts: 15; relay attempts: 12; retry interval: 250 ms. Chat/file result mailboxes and caches have explicit bounds.",
+                "Application timing",
+                "Heartbeat 2 s, expiry 10 s, chat gap wait 1 s, file idle 30 s and total transfer 15 minutes.",
             ),
             (
-                "File lifetime",
-                "Default idle timeout: 30 seconds; total transfer deadline: 15 minutes. Incomplete transfers are cancelled and temporary resources are cleaned.",
-            ),
-            (
-                "Remaining scope",
-                "No BBR/CUBIC, persistent offline messages, automatic reconnect, resumable transfer, or per-user key isolation. Browser HTTP upload still buffers JSON/base64. UI history is not persistent or synchronized across tabs.",
+                "Not provided",
+                "BBR, offline history, automatic reconnect, resumable files, password reset and browser multi-tab synchronization. BBR is not claimed; CUBIC is the implemented alternative.",
             ),
         ],
-        [145, WIDTH - 145],
+        [125, WIDTH - 125],
     )
-    r.h("Run the demo")
+    r.h("Questions requiring instructor confirmation")
     r.p(
-        "Create/activate a Python 3.10+ virtual environment, install requirements.txt, generate one key with python -m collab.keygen, and set COLLAB_KEY to that same key in every terminal. Full platform-specific setup is in README.md."
+        "(1) Does TCP control plus reliable UDP payload delivery satisfy the overview's TCP-transfer wording, given the explicit UDP file rubric? (2) Does server-mediated presence fan-out satisfy discovery broadcast, or is literal LAN broadcast autodiscovery required? (3) Is a documented application-level CUBIC adaptation acceptable, including the disclosed TCP-specific omissions? These are questions, not inferred approvals. See docs/ASSIGNMENT_CLARIFICATIONS.md."
     )
-    r.code(
-        "# Terminal 1\npython -m collab.server --tcp-port 9000 --udp-port 9001\n# Terminal 2\npython -m collab.webui --name alice --web-port 8080\n# Terminal 3\npython -m collab.webui --name bob --web-port 8081"
-    )
+    r.h("Regeneration and evidence integrity")
     r.p(
-        "Open http://127.0.0.1:8080 and :8081. Demonstrate online users, private/broadcast chat, file progress and a verified saved file; then stop a client and server to show cleanup. For LAN use, bind the server to 0.0.0.0 and pass its LAN IP using client --host; allow server TCP 9000 and UDP 9001. HTTP remains local. Existing CLI: python -m collab.client --name carol."
-    )
-    r.h("Regenerate this report")
-    r.code(
-        "# ReportLab is a report-generation dependency only\npython -m pip install reportlab\npython -m unittest discover -s tests -v > docs/test_results.txt 2>&1\npython docs/build_report.py"
-    )
-    r.p(
-        "The generator reads current protocol constants and the completed test log; it refuses an unsuccessful run or a mismatched test inventory. --test-log and --output accept alternate paths. Default output: docs/TECHNICAL_REPORT.pdf. No application sockets or test workers are started by the generator."
-    )
-    r.p(
-        "<b>Transport interpretation:</b> the brief describes UDP streaming/file reassembly, a TCP handshake, and a techniques section mentioning TCP reliable transfer. This implementation uses encrypted TCP control plus encrypted UDP application data. The report records that design choice and the unimplemented congestion algorithms explicitly.",
-        "small",
+        "Install ReportLab as a report-generation dependency if not using a bundled runtime. Refresh docs/test_results.txt with a complete successful run, then execute python docs/build_report.py. The generator checks source test inventory against the log and refuses stale/mismatched counts. State diagrams are editable in this Python source and mirrored as Mermaid in docs/STATE_MACHINES.md. Packaging, repository visibility, publication, and submission were not performed."
     )
 
 

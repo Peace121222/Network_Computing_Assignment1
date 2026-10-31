@@ -39,6 +39,7 @@ from collab.shared.limits import (
 )
 from collab.shared.protocol import data_packet, validate_tcp, validate_udp
 from collab.shared.resilience import Cleanup, RetryDelay, SendBackoff, retryable
+from collab.transport.congestion import CubicController
 from collab.transport.handshake import client_login
 from collab.transport.security import Channel, unseal
 from collab.transport.tcp import TCPReader, send_tcp, write_tcp
@@ -196,6 +197,7 @@ class Client:
             self._set_status("connecting")
             session = {
                 "id": object(),
+                "congestion": CubicController(),
                 "stop": threading.Event(),
                 "finalize_queue": queue.Queue(maxsize=FILE_WRITE_QUEUE),
                 "file_resources": {},
@@ -807,6 +809,10 @@ class Client:
             OSError: A non-retryable UDP error occurs.
         """
         session = self._capture_session() if session is None else session
+        with self._state_lock:
+            congestion = session.get("congestion")
+            if congestion is None:
+                congestion = session["congestion"] = CubicController()
         inflight = {}
         i = 0
         delay = RetryDelay(session["stop"], log, "UDP send", log_errors=False)
@@ -827,14 +833,19 @@ class Client:
                     i += 1
                 for mid, (p, ev, tries, last) in list(inflight.items()):
                     if ev.is_set():
+                        congestion.acknowledge(mid)
                         del inflight[mid]
                         with self.pending_lock:
                             self.pending.pop(mid, None)
                         continue
-                    if time.monotonic() - last < timeout:
+                    if tries and not congestion.retry_due(
+                        mid, time.monotonic(), timeout
+                    ):
                         continue
                     if tries >= retries:
                         raise TimeoutError("No ACK for packet " + mid)
+                    if not congestion.try_send(mid, minimum_retry=timeout):
+                        continue
                     try:
                         with self._state_lock:
                             if (
@@ -855,6 +866,7 @@ class Client:
             with self.pending_lock:
                 for mid in inflight:
                     self.pending.pop(mid, None)
+                    congestion.discard(mid)
 
     def packet(
         self, to: str, kind: str, payload: str = "", meta: dict[str, Any] | None = None

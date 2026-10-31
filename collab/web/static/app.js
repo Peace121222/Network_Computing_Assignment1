@@ -24,8 +24,6 @@ async function sendChat() {
     const text = $('message').value;
     if (!text.trim()) return;
     const recipient = $('to').value;
-    // Claim the submission before awaiting HTTP so repeated clicks/Enter cannot
-    // create distinct packet IDs for the same pending input.
     chatSubmitting = true;
     $('send-chat').disabled = true;
     try {

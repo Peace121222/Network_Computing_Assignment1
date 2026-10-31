@@ -264,7 +264,7 @@ class Client:
             ),
         ]
         self.running.set()
-        # Workers wait until all starts succeed, preventing callbacks during rollback.
+
         session["started"] = threading.Event()
         for thread in self.threads:
             thread.start()
@@ -457,7 +457,7 @@ class Client:
         return run
 
     def _close_before(self, deadline):
-        # A worker must not wait for a lifecycle owner that may be joining it.
+
         if threading.current_thread() in self.threads:
             with self._state_lock:
                 self._detach_session()
@@ -927,14 +927,3 @@ class Client:
             OSError: Reading the source or sending packets fails.
         """
         return self._file_transfers.file(recipient, path)
-
-
-def main() -> int:
-    """Preserve the legacy entry point without importing the CLI during core import."""
-    from collab.client.cli import main as cli_main
-
-    return cli_main()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

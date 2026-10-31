@@ -28,7 +28,7 @@ from collab.transport.security import (
     unseal,
 )
 from collab.transport.tcp import TCPReader, frame_tcp, send_tcp
-from collab.transport.udp import cipher, encode_udp, decode_udp, udp_frame_size
+from collab.transport.udp import encode_udp, decode_udp, udp_frame_size
 from collab.transport.handshake import client_login
 from tests.auth_support import tls_connection, PASSWORD, client_login as fixture_login
 from tests.stream_support import Stream, LoginStream, frame
@@ -309,10 +309,11 @@ class PathTests(unittest.TestCase):
         self.server.udp.sendto.assert_not_called()
 
     def test_endpoint_requires_response_and_does_not_refresh_activity(self):
+        self.user["udp_addr"] = None
         self.receive(address=self.new)
         challenge = decode_udp(self.server.udp.sendto.call_args.args[0], self.server.f)
         self.assertEqual(challenge["type"], "path_challenge")
-        self.assertEqual(self.user["udp_addr"], self.old)
+        self.assertIsNone(self.user["udp_addr"])
         response = dict(self.packet, type="path_response", nonce=challenge["nonce"])
         self.receive(response, address=self.new, now=102)
         self.assertEqual(self.user["udp_addr"], self.new)
@@ -321,7 +322,8 @@ class PathTests(unittest.TestCase):
         self.assertEqual(self.user["last_seen"], 103)
         self.assertEqual(self.server.revision, 0)
 
-    def test_wrong_expired_and_replayed_response_cannot_rebind(self):
+    def test_wrong_expired_and_replayed_initial_response_is_rejected(self):
+        self.user["udp_addr"] = None
         self.receive(address=self.new)
         response = dict(
             self.packet, type="path_response", nonce=self.user["udp_candidate"]["nonce"]
@@ -329,7 +331,7 @@ class PathTests(unittest.TestCase):
         self.receive(dict(response, nonce="f" * 64), address=self.new)
         self.receive(response, address=self.old)
         self.receive(response, address=self.new, now=103)
-        self.assertEqual(self.user["udp_addr"], self.old)
+        self.assertIsNone(self.user["udp_addr"])
         self.receive(address=self.new, now=104)
         response["nonce"] = self.user["udp_candidate"]["nonce"]
         raw = self.receive(response, address=self.new, now=104.1)
@@ -338,6 +340,7 @@ class PathTests(unittest.TestCase):
         self.assertEqual(self.user["last_seen"], 100)
 
     def test_challenge_rate_limit_recovery_and_single_candidate(self):
+        self.user["udp_addr"] = None
         self.receive(address=self.new)
         first = self.user["udp_candidate"]["nonce"]
         self.receive(address=("127.0.0.1", 3000), now=101.49)
@@ -349,6 +352,7 @@ class PathTests(unittest.TestCase):
         self.assertEqual(self.user["last_seen"], 100)
 
     def test_path_messages_cannot_revive_expired_session(self):
+        self.user["udp_addr"] = None
         self.receive(address=self.new)
         response = dict(
             self.packet, type="path_response", nonce=self.user["udp_candidate"]["nonce"]
@@ -459,7 +463,7 @@ class SecurityNetworkTests(unittest.TestCase):
         )
         self.assertEqual(client.names, ["alice"])
         self.assertLess(client.presence_revision, 1_000_000)
-        # Deliver an authentic snapshot, then replay it after a newer one.
+
         old = encode_udp(dict(spoof, revision=100), self.server.f, user["udp_security"])
         self.server.udp.sendto(old, user["udp_addr"])
         wait(self, lambda: client.presence_revision == 100)

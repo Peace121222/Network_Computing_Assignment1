@@ -19,10 +19,9 @@ from cryptography.fernet import Fernet
 
 from collab.accounts import Accounts, AuthLimiter
 from collab.client.core import Client as ProductionClient
-from collab.common import TCPReader, recv_tcp, send_tcp
+from collab.transport.tcp import TCPReader, recv_tcp, send_tcp
 from collab.transport.security import Channel, HEADER, VERSION, ZERO_CONTEXT
 from collab.transport.tcp import frame_tcp
-from collab.transport.udp import cipher
 from tests.auth_support import (
     Client,
     PASSWORD,
@@ -85,7 +84,7 @@ class AccountTests(unittest.TestCase):
 
     def test_limiter_expiry_and_memory(self):
         now = [0]
-        limiter = AuthLimiter(limit=2, window=5, capacity=3, clock=lambda: now[0])
+        limiter = AuthLimiter(limit=2, window=5, clock=lambda: now[0])
         self.assertTrue(limiter.allow("a"))
         self.assertTrue(limiter.allow("a"))
         self.assertFalse(limiter.allow("a"))
@@ -93,7 +92,9 @@ class AccountTests(unittest.TestCase):
         self.assertTrue(limiter.allow("a"))
         for i in range(10):
             limiter.allow(str(i))
-        self.assertLessEqual(len(limiter.entries), 3)
+        now[0] = 10
+        limiter.allow("fresh")
+        self.assertEqual(set(limiter.entries), {"fresh"})
 
 
 class AuthenticationNetworkTests(unittest.TestCase):
@@ -320,14 +321,13 @@ class AuthLimiterCompatibilityTests(unittest.TestCase):
         now[0] = 5
         self.assertTrue(limiter.allow("client"))
 
-    def test_recently_used_entries_are_retained_at_capacity(self):
-        limiter = AuthLimiter(limit=2, capacity=2, clock=lambda: 0)
+    def test_activity_on_other_ips_does_not_reset_a_limit(self):
+        limiter = AuthLimiter(limit=2, clock=lambda: 0)
         self.assertTrue(limiter.allow("alice"))
-        self.assertTrue(limiter.allow("bob"))
         self.assertTrue(limiter.allow("alice"))
-        self.assertTrue(limiter.allow("carol"))
+        for i in range(10):
+            self.assertTrue(limiter.allow(str(i)))
         self.assertFalse(limiter.allow("alice"))
-        self.assertTrue(limiter.allow("bob"))
 
 
 class ReaderTests(unittest.TestCase):

@@ -6,51 +6,10 @@ from collab.transport.security import Channel
 
 
 import json
-import base64
-import os
 from cryptography.fernet import Fernet, InvalidToken
 from collab.shared.protocol import _require
 from collab.shared.limits import UDP_MTU
 from collab.transport.security import encrypted_size, seal, unseal
-
-
-def get_key() -> bytes:
-    """Read and validate the legacy COLLAB_KEY environment variable.
-
-    Account-based client and server entry points do not use this helper for login.
-
-    Returns:
-        Canonically encoded 32-byte Fernet key material as URL-safe base64 bytes.
-
-    Raises:
-        RuntimeError: COLLAB_KEY is missing or empty.
-        ValueError: COLLAB_KEY is not a canonical Fernet key.
-    """
-    key = os.getenv("COLLAB_KEY", "")
-    if not key:
-        raise RuntimeError("Set COLLAB_KEY (generate with python -m collab.keygen)")
-    try:
-        raw = key.encode("ascii")
-        decoded = base64.b64decode(raw, altchars=b"-_", validate=True)
-        if len(decoded) != 32 or base64.urlsafe_b64encode(decoded) != raw:
-            raise ValueError("Invalid key encoding")
-        Fernet(raw)
-        return raw
-    except (ValueError, UnicodeError) as exc:
-        raise ValueError("COLLAB_KEY must be a valid Fernet key") from exc
-
-
-def cipher() -> Fernet:
-    """Construct a legacy Fernet cipher from COLLAB_KEY.
-
-    Returns:
-        A cipher using the key returned by get_key().
-
-    Raises:
-        RuntimeError: COLLAB_KEY is missing or empty.
-        ValueError: COLLAB_KEY is invalid.
-    """
-    return Fernet(get_key())
 
 
 def udp_frame_size(msg: dict[str, Any]) -> int:

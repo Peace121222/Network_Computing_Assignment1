@@ -179,7 +179,7 @@ class WebUIIntegrationTests(unittest.TestCase):
 class BrowserLogicTests(unittest.TestCase):
     def test_rendering_messages_presence_and_independent_file_progress(self):
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
-        # Execute the actual page script against a small DOM double; no networking library.
+
         harness = r"""
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
@@ -356,7 +356,7 @@ class HTTPConcurrencyTests(unittest.TestCase):
         self.assertEqual(self.request("/chat", {"to": "*", "text": "excess"})[0], 503)
         self.assertEqual(self.handler.runtime.tasks.admitted, 6)
         self.assertEqual(len(self.handler.runtime.tasks.threads), 2)
-        # Avoid the barrier on later calls after releasing the initial two senders.
+
         self.client.chat.side_effect = None
         self.release.set()
         wait_for(self, lambda: self.handler.runtime.tasks.admitted == 0)
@@ -446,7 +446,7 @@ class HTTPConcurrencyTests(unittest.TestCase):
     def test_http_handler_limit_has_eight_workers_and_sixteen_connections(self):
         sockets = []
         try:
-            # Incomplete headers occupy handlers and the bounded waiting slots.
+
             for _ in range(16):
                 sock = socket.create_connection(
                     ("127.0.0.1", self.http.server_port), timeout=1

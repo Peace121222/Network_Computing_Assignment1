@@ -34,7 +34,7 @@ class ChatSender:
         record["result"] = msg
         if msg["state"] != "rejected":
             self._chat_accepted(msg["id"], record)
-        # A final TCP result supersedes a lost ingress ACK, including rejection.
+
         with client.pending_lock:
             event = client.pending.get(msg["id"])
             if event is not None:
@@ -51,7 +51,7 @@ class ChatSender:
             if packet["to"] == "*"
             else [packet["to"]]
         )
-        # Check forwarded metadata before reserving an outgoing chat slot.
+
         destination = max(names or [client.name], key=lambda n: len(json.dumps(n)))
         forwarded = dict(
             packet,
@@ -114,7 +114,7 @@ class ChatSender:
                     ):
                         self._chat_accepted(packet["id"], record)
             except TimeoutError:
-                # Ingress may have succeeded while its ACK was lost; wait for final TCP status.
+
                 pass
             while not record["done"].is_set():
                 remaining = deadline - time.monotonic()

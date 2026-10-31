@@ -362,7 +362,7 @@ class StateDiagram(Diagram):
                 self.canv.line(95, y + 20, 82, y + 20)
             self.canv.line(82, positions[0] + 20, 82, positions[-2] + 20)
             self.arrow(82, middle, 73, middle)
-        # A return path represents cleanup or the next transaction.
+
         right = WIDTH - 15
         bottom = positions[-1] + 20
         top = positions[0] + 20
@@ -400,7 +400,7 @@ def populate(report, result):
     )
     r.h("Transport interpretation")
     r.p(
-        "The assignment's goal and file-transfer rubric require UDP streaming and reassembly; its technology overview also mentions TCP reliable transfer. This project uses TCP for TLS authentication/control/results and UDP for application payloads, discovery, and ACK/retry. Presence broadcast is server fan-out, not LAN broadcast autodiscovery. These two interpretations are documented as instructor questions in docs/ASSIGNMENT_CLARIFICATIONS.md; no instructor approval is claimed."
+        "The assignment's goal and file-transfer rubric require UDP streaming and reassembly; its technology overview also mentions TCP reliable transfer. This project uses TCP for TLS authentication/control/results and UDP for application payloads, discovery, and ACK/retry. Presence broadcast is server fan-out, not LAN broadcast autodiscovery. These interpretations remain instructor questions; no instructor approval is claimed."
     )
 
     r.page(2, "2. Architecture, concurrency, and resource ownership")
@@ -436,10 +436,10 @@ def populate(report, result):
     )
     r.h("Workers and locks")
     r.p(
-        "Server workers accept TCP, receive UDP, schedule relay retries, expire sessions, and publish presence. A supervisor owns fatal-worker cleanup; each session has a TCP handler and writer. Clients own TCP receive, UDP receive, heartbeat, and receive-disk workers. HTTP has two send workers/four waiting slots, two upload slots, and eight handlers/sixteen admitted connections."
+        "Server workers accept TCP, receive UDP, schedule relay retries, expire sessions, and publish presence. An event-driven failure monitor owns fatal-worker cleanup without polling for lifecycle ownership; each session has a TCP handler and writer. Clients own TCP receive, UDP receive, heartbeat, and receive-disk workers. HTTP has two send workers/four waiting slots, two upload slots, and eight handlers/sixteen admitted connections."
     )
     r.p(
-        "Registry locks protect short state changes. Session gates are acquired in token order; socket sends and joins occur outside the server registry lock. CUBIC state has its own lock and never sleeps or calls back into application locks. The receive worker owns temporary streams; cleanup retains unfinished resources for retry within a shared shutdown deadline."
+        "Registry locks protect short state changes. Session gates are acquired in token order; socket sends and joins occur outside the server registry lock. CUBIC state has its own lock and never sleeps or calls back into application locks. The receive worker owns temporary streams; socket/file cleanup retains unfinished resources for a later close within a shared shutdown deadline. HTTP workers use a single FIFO queue; pending jobs are cancelled at stop and their cleanup is attempted once, with failures reported rather than retried."
     )
     r.h("Production configuration and scaling")
     r.p(
@@ -472,7 +472,7 @@ def populate(report, result):
             ),
             (
                 "path_challenge / path_response (UDP)",
-                "A fresh nonce and candidate endpoint must match before adopting a changed UDP address. Path checks alone do not extend heartbeat life.",
+                "A fresh nonce and initial endpoint must match before application data is accepted. The verified address stays fixed until a new login. Path checks alone do not extend heartbeat life.",
             ),
             (
                 "data/chat (UDP)",
@@ -499,7 +499,7 @@ def populate(report, result):
         "Clients load an explicit CA and verify the server DNS/IP SAN before sending credentials. TLS 1.2 or later protects the entire TCP connection; there is no insecure bypass. SQLite stores id, unique case-sensitive username, Argon2id password_hash, and created_at. Policy: 8-128 password characters, random library-managed salts, 19 MiB memory, two iterations and parallelism one. Four hashing jobs and bounded login frames/deadlines limit unauthenticated work."
     )
     r.p(
-        "A valid password is checked before the server reports an already-online account. Username reservation is atomic. Each login receives a random Fernet key, public session context and separate authorization token. The key is not derived from the password/hash and is never stored in SQLite or printed. COLLAB_KEY and the legacy nonce handshake are not login mechanisms in this protocol version."
+        "A valid password is checked before the server reports an already-online account. Username reservation is atomic. Each login receives a random Fernet key, public session context and separate authorization token. The key is not derived from the password/hash and is never stored in SQLite or printed. Legacy shared-key helpers and compatibility entry points have been removed; authentication uses only the account/TLS flow."
     )
     r.code(
         "auth TCP = TLS(uint32_be(length) || JSON)\ncontrol TCP = TLS(uint32_be(length) || Fernet(header || JSON))\nUDP = public_context_hex[32] || Fernet(header || JSON)\nheader = !B16sBBQ"
@@ -511,7 +511,7 @@ def populate(report, result):
     )
     r.h("Replay, endpoint and cleanup boundaries")
     r.p(
-        f"TCP requires the next sequence. UDP uses a {REPLAY_WINDOW:,}-packet replay bitmap. Every actual retry retains its application ID but uses a fresh security sequence, allowing legitimate deduplication without accepting replayed frames. UDP schemas and session credentials are checked before endpoint/liveness updates. A challenge response proves endpoint reachability. Logout, TCP loss, heartbeat expiry, and interrupts retire session references; Python cannot promise physical key-memory erasure. TLS plus a trusted CA prevents an old welcome from authenticating a new TLS connection."
+        f"TCP requires the next sequence. UDP uses a {REPLAY_WINDOW:,}-packet replay bitmap. Every actual retry retains its application ID but uses a fresh security sequence, allowing legitimate deduplication without accepting replayed frames. UDP schemas and session credentials are checked before endpoint/liveness updates. A challenge response proves initial endpoint reachability; changing the verified UDP address requires a new login. Authentication uses fixed per-IP windows; expired entries are pruned on the next attempt without an LRU cache. Logout, TCP loss, heartbeat expiry, and interrupts retire session references; Python cannot promise physical key-memory erasure. TLS plus a trusted CA prevents an old welcome from authenticating a new TLS connection."
     )
 
     r.page(5, "5. Authentication and data lifecycles")
@@ -643,7 +643,7 @@ def populate(report, result):
         ),
         (
             "Cleanup is independent of another cleanup failure",
-            "Session identities pin outstanding work; cancellation releases congestion flight. Supervisors signal before joining. Socket shutdown, worker pools, file cleanup and joins share bounded deadlines and retain failed resources for retry. No automatic reconnect silently recreates credentials or keys.",
+            "Session identities pin outstanding work; cancellation releases congestion flight. Supervisors signal before joining. Socket shutdown, worker pools, file cleanup and joins share bounded deadlines. Failed sockets/files can be retried on a later close; worker job cleanup runs once and reports failure. No automatic reconnect silently recreates credentials or keys.",
         ),
     ]:
         r.h(title)
@@ -667,7 +667,7 @@ def populate(report, result):
                 {
                     "test_congestion": "Deterministic window/RTT/loss/idle behavior and framing regression.",
                     "test_production_scale": "Real TLS accounts and 20 clients under explicit production configuration.",
-                    "test_accounts": "Persistence, password policy, races, TLS trust, rate windows and terminal flow.",
+                    "test_authentication": "Persistence, password policy, races, TLS trust, fixed rate windows, framing and terminal flow.",
                     "test_concurrency": "Bounded pools, 20 clients, scheduler fairness, slow workers and cleanup.",
                     "test_files": "Chunks, hashes, receipts, reordering, loss, disk failure and streamed source limits.",
                     "test_chat": "Broadcast/private results, ordering, missing ACKs and concurrent files.",
@@ -675,10 +675,10 @@ def populate(report, result):
                     "test_integration": "Real encrypted TCP/UDP private/broadcast and binary/empty files.",
                     "test_security": "Session/channel binding, replay windows, path verification and stale packets.",
                     "test_sessions": "Presence, expiry, disconnect/relogin and endpoint lifecycle.",
-                    "test_web_ui": "HTTP/static routes, progress and JavaScript rendering.",
+                    "test_web": "HTTP/static routes, progress, JavaScript rendering, bounded admission and cancellation.",
                     "test_web_concurrency": "Upload/send admission, cancellation and local HTTP cleanup.",
                     "test_protocol": "Wire schemas, invalid payloads, Unicode and boundary sizes.",
-                    "test_refactoring": "Compatibility, CLI flags, certificate generation and source grammar.",
+                    "test_refactoring": "Entry points, CLI flags, certificate generation and source grammar.",
                     "test_resilience": "Killed processes, worker exceptions, deadlines and cleanup retries.",
                 }.get(name, "Behavioral regression tests."),
             )
@@ -687,13 +687,13 @@ def populate(report, result):
         [104, 48, WIDTH - 152],
     )
     r.p(
-        "Localhost regression tests use OS-assigned ports, temporary databases/certificates/files, fake clocks and controlled loss/error injection. They do not establish WAN fairness or throughput. The separately recorded terminal/LAN-interface demo and its exact scope are in docs/demo_results.txt. A local interface test is not evidence of a second physical device. Windows/Linux execution and instructor approval remain external verification tasks.",
+        "Localhost regression tests use OS-assigned ports, temporary databases/certificates/files, fake clocks and controlled loss/error injection. They do not establish WAN fairness or throughput. Historical terminal/LAN-interface checks ran on the same Mac; their supporting evidence files are no longer distributed. A local interface test is not evidence of a second physical device. Windows/Linux execution and instructor approval remain external verification tasks.",
         "small",
     )
 
     r.page(10, "10. Reproduction, limits, and open interpretation questions")
     r.code(
-        "python3 -m venv .venv\nsource .venv/bin/activate\npython -m pip install -r requirements.txt\npython -m collab.certgen --out certs --names localhost 127.0.0.1\n# Server (one terminal)\npython -m collab.server --cert certs/server.crt --key certs/server.key\n# Alice and Bob (separate terminals; register, then log in)\npython -m collab.webui --name alice --ca certs/ca.crt --web-port 8080\npython -m collab.webui --name bob --ca certs/ca.crt --web-port 8081"
+        "python3 -m venv .venv\nsource .venv/bin/activate\npython -m pip install -r requirements.txt\npython -m collab.certgen --out certs --names localhost 127.0.0.1\n# Server (one terminal)\npython -m collab.server --cert certs/server.crt --key certs/server.key\n# Alice and Bob (separate terminals; register, then log in)\npython -m collab.web --name alice --ca certs/ca.crt --web-port 8080\npython -m collab.web --name bob --ca certs/ca.crt --web-port 8081"
     )
     r.p(
         "For a 20-user same-IP demonstration, add --auth-limit 60 to the server. For LAN, include the actual server IP in certificate SANs, bind --host 0.0.0.0, securely distribute only ca.crt, and set each client's --host to that IP. HTTP stays on client loopback. The README contains full download-directory and CLI examples."
@@ -722,11 +722,11 @@ def populate(report, result):
     )
     r.h("Questions requiring instructor confirmation")
     r.p(
-        "(1) Does TCP control plus reliable UDP payload delivery satisfy the overview's TCP-transfer wording, given the explicit UDP file rubric? (2) Does server-mediated presence fan-out satisfy discovery broadcast, or is literal LAN broadcast autodiscovery required? (3) Is a documented application-level CUBIC adaptation acceptable, including the disclosed TCP-specific omissions? These are questions, not inferred approvals. See docs/ASSIGNMENT_CLARIFICATIONS.md."
+        "(1) Does TCP control plus reliable UDP payload delivery satisfy the overview's TCP-transfer wording, given the explicit UDP file rubric? (2) Does server-mediated presence fan-out satisfy discovery broadcast, or is literal LAN broadcast autodiscovery required? (3) Is a documented application-level CUBIC adaptation acceptable, including the disclosed TCP-specific omissions? These are questions, not inferred approvals."
     )
     r.h("Regeneration and evidence integrity")
     r.p(
-        "Install ReportLab as a report-generation dependency if not using a bundled runtime. Refresh docs/test_results.txt with a complete successful run, then execute python docs/build_report.py. The generator checks source test inventory against the log and refuses stale/mismatched counts. State diagrams are editable in this Python source and mirrored as Mermaid in docs/STATE_MACHINES.md. Packaging, repository visibility, publication, and submission were not performed."
+        "Install ReportLab as a report-generation dependency if not using a bundled runtime. Save a complete successful unittest run outside the repo, then execute python docs/build_report.py --test-log /path/to/test-results.log. The generator checks source test inventory against the log and refuses stale/mismatched counts. State diagrams are editable in this Python source. Packaging, repository visibility, publication, and submission were not performed."
     )
 
 

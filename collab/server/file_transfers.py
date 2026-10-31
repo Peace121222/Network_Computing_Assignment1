@@ -118,7 +118,7 @@ class ServerFileTransfers:
             ],
         }
         record["finished"] = now
-        # Completed records retain only bounded retry identities, not packet payloads.
+
         for key, item in list(self.server.pending.items()):
             if item.get("file_key") == record["key"]:
                 del self.server.pending[key]

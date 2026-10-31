@@ -203,7 +203,7 @@ class RelayRouter:
             result=None,
         )
         if reason is not None:
-            # No recipient accepted; keep a negative result for idempotent retries.
+
             failure_name = msg["to"] if msg["to"] != "*" else msg["from"]
             record["result"] = {
                 "type": "chat_status",
@@ -216,7 +216,7 @@ class RelayRouter:
             server.chat_records[key] = record
             self._publish_chat_result_locked(record)
             return False
-        # Relay IDs are hop-local: two senders may safely choose the same original ID.
+
         relay_id = uuid.uuid4().hex
         plans = []
         self._chat_support(source)
@@ -237,7 +237,7 @@ class RelayRouter:
                 },
             }
             if udp_frame_size(packet) > UDP_MTU:
-                # Reject packets that cannot fit after adding relay metadata and framing.
+
                 with source["control_condition"]:
                     source["chat_mailbox"].pop(key, None)
                 return False
@@ -336,7 +336,7 @@ class RelayRouter:
                 if congestion is None:
                     congestion = user["congestion"] = CubicController()
                 congestion.retain(active_ids.get(name, ()))
-            # Persist the 3:1 scheduling phase across small congestion windows.
+
             selected = []
             chat_index = file_index = 0
             phase = self._schedule_phase

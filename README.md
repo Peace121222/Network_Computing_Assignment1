@@ -151,13 +151,13 @@ Stop an account's CLI before using that account in a Web backend. Run Alice and 
 
 ```bash
 # Alice
-python -m collab.webui --name alice --ca certs/ca.crt \
+python -m collab.web --name alice --ca certs/ca.crt \
   --web-port 8080 --downloads downloads/alice
 ```
 
 ```bash
 # Bob
-python -m collab.webui --name bob --ca certs/ca.crt \
+python -m collab.web --name bob --ca certs/ca.crt \
   --web-port 8081 --downloads downloads/bob
 ```
 
@@ -165,7 +165,7 @@ Complete the same terminal login menu. The backend opens its HTTP listener only 
 
 For a third account, run `--name carol --web-port 8082 --downloads downloads/carol` with the same CA and register Carol in the terminal.
 
-`python -m collab.web` is equivalent to `python -m collab.webui`. HTTP always binds to `127.0.0.1`; open it on the machine running that backend. Closing a browser tab does not log out. Use Ctrl+C in the backend terminal to stop its client session.
+HTTP always binds to `127.0.0.1`; open it on the machine running that backend. Closing a browser tab does not log out. Use Ctrl+C in the backend terminal to stop its client session.
 
 ## Configuration
 
@@ -191,9 +191,9 @@ All paths are relative to the process working directory unless absolute. There i
 | `--out` | `certgen` | `certs` | Certificate output directory |
 | `--names` | `certgen` | `localhost 127.0.0.1` | One or more DNS/IP SAN values; the first is also the certificate common name |
 
-Use `python -m collab.server --help`, `python -m collab.client --help`, `python -m collab.webui --help`, or `python -m collab.certgen --help` to inspect options.
+Use `python -m collab.server --help`, `python -m collab.client --help`, `python -m collab.web --help`, or `python -m collab.certgen --help` to inspect options.
 
-`COLLAB_KEY` is retained only by legacy codec helpers (`get_key()` / `cipher()`) and `python -m collab.keygen`. The server and client entry points do not use it for login. Setting it cannot bypass account authentication.
+The supported process entry points are `python -m collab.server`, `python -m collab.client`, `python -m collab.web`, and `python -m collab.certgen`. The legacy `collab.common`, `collab.webui`, `collab.keygen`, `get_key()` / `cipher()`, and `collab.client.core.main()` interfaces have been removed. Import helpers from `collab.shared` or `collab.transport` modules directly. `COLLAB_KEY` is not used.
 
 ### LAN example
 
@@ -241,15 +241,17 @@ python scripts/verify_lan.py --host 192.168.1.10 --port 9000 --ca certs/ca.crt
 
 Replace the example IP with the server's address. On success, the helper prints JSON with `private_chat` and `broadcast` set to `true`, `saved_file_bytes` equal to `16384`, and the saved file's SHA-256. It creates two randomly named accounts that **remain in the server database**; its local temporary files and client sessions are cleaned up. Repeated runs share the source-IP authentication budget. For a deliberate 20-user manual demo, start the server with `--auth-limit 60`.
 
-The demo was previously verified on localhost and a LAN interface on the same Mac; a second physical device has not been tested. Instructor confirmation remains pending for TCP versus UDP transfer wording, server-mediated presence versus LAN broadcast discovery, and acceptance of the application-level CUBIC adaptation.
+Acceptance checks on October 31, 2026, after simplification used three separate PTY terminals: one server and two CLI clients. Registration/login, online users, private chat, broadcast, and a 16 KiB binary file with matching SHA-256 passed; both clients and the server exited with code 0. The verification helper also passed against localhost and the same Mac's LAN IP. Temporary certificates, accounts, and files were isolated from normal application data and removed afterward. This does not establish connectivity between two physical machines.
+
+A second physical device, Windows/Linux execution, and instructor confirmation remain unverified. Instructor questions concern TCP versus UDP transfer wording, server-mediated presence versus LAN broadcast discovery, and acceptance of the application-level CUBIC adaptation.
 
 ## Protocol and resource ownership
 
 Authentication JSON uses four-byte length-prefixed frames inside verified TLS: `register → registered/error` or `login → welcome/error`. A successful login returns an independent random token, public session ID, Fernet key, and server UDP port. Account storage contains only `id`, `username`, `password_hash`, and `created_at`; session keys are never stored in SQLite or printed.
 
-Established TCP frames also use the ordered session envelope. UDP datagrams start with a 32-byte public session lookup hint, followed by an encrypted envelope bound to protocol version, session, direction, transport, and sequence number. UDP uses a 4,096-packet replay window; TCP requires the exact next sequence. Retries retain application IDs but use fresh envelope sequences. UDP endpoint challenge/response precedes application traffic.
+Established TCP frames also use the ordered session envelope. UDP datagrams start with a 32-byte public session lookup hint, followed by an encrypted envelope bound to protocol version, session, direction, transport, and sequence number. UDP uses a 4,096-packet replay window; TCP requires the exact next sequence. Retries retain application IDs but use fresh envelope sequences. UDP endpoint challenge/response precedes application traffic. The verified UDP address and port remain fixed for that session; after an address change, close the client and log in again.
 
-The CLI owns terminal input/output; the reusable client owns sockets and workers; the local HTTP backend calls that same client core; the server owns accounts, active sessions, routing, and relay queues. Existing public imports remain available through `collab.client.Client`, `collab.server.Server`, `collab.common`, and `collab.webui`. `collab.client.core.main()` remains a compatibility entry point. Static Web resources intentionally load at import so the existing `PAGE` export and startup errors remain compatible.
+The CLI owns terminal input/output; the reusable client owns sockets and workers; the local HTTP backend calls that same client core; the server owns accounts, active sessions, routing, and relay queues. Reusable application classes are `collab.client.Client` and `collab.server.Server`. Static Web resources load when the Web handlers are imported.
 
 Important defaults, defined in `collab/shared/limits.py` and the runtime constructors:
 
@@ -259,7 +261,7 @@ Important defaults, defined in `collab/shared/limits.py` and the runtime constru
 | Server pending packets / per-recipient pending packets | 8,192 / 1,024 |
 | Authentication frame / concurrent Argon2 jobs | 2,048 bytes / 4 |
 | Authentication attempts per source IP | 10 per 60-second fixed window, including registration and successful login |
-| Remembered authentication IPs | At most 4,096; expiring LRU state |
+| Authentication IP state | Fixed windows; expired entries are removed on the next attempt; no LRU eviction |
 | Argon2id parameters | 19 MiB memory, 2 iterations, parallelism 1, random salt |
 | TCP connection timeout / client login deadline / server login deadline | 5 / 5 / 4 seconds |
 | Heartbeat interval / session expiry / expiry check interval | 2 / 10 / 0.5 seconds |
@@ -270,7 +272,7 @@ Important defaults, defined in `collab/shared/limits.py` and the runtime constru
 
 The client login deadline starts before TCP setup; the connection attempt also has its own timeout. Valid application UDP traffic from a verified endpoint extends heartbeat lifetime; path verification alone does not. Losing TCP also ends the session. Chat ACKs indicate application acceptance, not that a person read the message. File completion requires the receiver's verification/save receipt. HTTP 202 means a send job was accepted locally, not that delivery is complete; exhausted HTTP capacity returns 503.
 
-Authentication limits are shared by clients behind the same source IP. SQLite is not encrypted at rest. Protect the database and private keys with filesystem permissions. Python releases session references during cleanup but does not guarantee key-memory zeroization. The replay window cannot identify a valid packet withheld before its first delivery. The Web UI consumes one local event queue; multiple tabs do not synchronize or restore chat history after refresh.
+Authentication limits are shared by clients behind the same source IP. SQLite is not encrypted at rest. Protect the database and private keys with filesystem permissions. HTTP workers share one bounded FIFO queue. Shutdown skips pending operations but runs their cleanup once; cleanup failures are logged and reported, with no automatic job-cleanup retry. Socket and receive-file cleanup still retain failed resources for an explicit later close attempt. The server failure monitor closes sessions after a critical worker failure without polling for lifecycle ownership. Python releases session references during cleanup but does not guarantee key-memory zeroization. The replay window cannot identify a valid packet withheld before its first delivery. The Web UI consumes one local event queue; multiple tabs do not synchronize or restore chat history after refresh.
 
 ## Development and verification
 
@@ -315,7 +317,7 @@ No lint or static type checker is configured, and Ruff, mypy, and Pyright are no
 | `User already connected` | Stop that account's existing client/backend or wait for its expired session to be removed. |
 | `Too many authentication attempts; try later` | Wait for the configured source-IP window to expire (60 seconds by default). Users behind one NAT share the limit. |
 | `Address already in use` | Stop the old listener or select unused TCP/UDP/Web ports. Each local Web backend needs a separate `--web-port`. |
-| Login works but presence/file delivery fails | Check bidirectional UDP, the server UDP port, firewall rules, and heartbeat expiry. |
+| Login works but presence/file delivery fails | Check bidirectional UDP, the server UDP port, firewall rules, and heartbeat expiry. After changing network/address/port, close the client and log in again. |
 | Web page does not open | Finish terminal login first, keep the backend running, and open its printed localhost URL on that machine. |
 | File was sent but is not complete | Wait for the completion event; look in the recipient's configured downloads directory for the prefixed filename. HTTP acceptance or chunk ACKs alone do not mean completion. |
 | Cannot open/write the database | Ensure its parent exists, the path is writable, and another process is not holding a long SQLite write lock. |
@@ -332,9 +334,6 @@ collab/
   shared/              Protocol validation, limits, concurrency, and cleanup helpers
   web/                 Local HTTP handlers, bounded runtime, and Web entry point
     static/            Browser HTML, CSS, and JavaScript
-  common.py            Compatibility exports for protocol/transport helpers
-  keygen.py            Legacy Fernet-key utility; not used for account login
-  webui.py             Compatibility Web entry point and exports
 scripts/               Repeatable LAN/private-chat/broadcast/file verifier
 tests/                 Unit, network, browser-interface, and compatibility tests
 docs/                  Generated PDF report and ReportLab report builder
@@ -347,7 +346,7 @@ Copy the complete `collab/web/static/` directory when copying the project.
 
 The generated [technical report](docs/TECHNICAL_REPORT.pdf) describes the account/TLS/CUBIC implementation. Its builder is [docs/build_report.py](docs/build_report.py). Report generation requires the application dependencies plus `reportlab`, which is optional and is not included in `requirements.txt`.
 
-The saved test log and supporting Markdown/JSON evidence files have been removed. References to those files in the existing PDF and report source are historical. The builder's default log path therefore does not exist; supply a fresh full-suite log explicitly. For example, on macOS/Linux, from the repository root in an environment with ReportLab available:
+Supporting Markdown/JSON evidence files and the default saved test log are not distributed. Supply a fresh full-suite log explicitly. For example, on macOS/Linux, from the repository root in an environment with ReportLab available:
 
 ```bash
 python -m unittest discover -s tests -v > /tmp/collab-test-results.log 2>&1

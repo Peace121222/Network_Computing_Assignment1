@@ -12,7 +12,6 @@ import typing
 import unittest
 from unittest.mock import patch
 
-from collab import common
 from collab.client import cli, core
 from collab.shared import limits, protocol
 from collab.transport import handshake, security, tcp, udp
@@ -22,11 +21,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RefactoringTests(unittest.TestCase):
-    def test_legacy_core_main_delegates_without_new_arguments(self):
-        with patch.object(cli, "main", return_value=17) as entry:
-            self.assertEqual(core.main(), 17)
-        entry.assert_called_once_with()
-        self.assertEqual(list(inspect.signature(core.main).parameters), [])
 
     def test_cli_and_core_import_in_either_order(self):
         for order in (("cli", "core"), ("core", "cli")):
@@ -56,9 +50,9 @@ class RefactoringTests(unittest.TestCase):
         }
         for name, value in expected.items():
             self.assertEqual(getattr(limits, name), value)
-        for module in (common, core, server_core, runtime, concurrency, cli):
+        for module in (core, server_core, runtime, concurrency, cli):
             self.assertEqual(module.SHUTDOWN_TIMEOUT, 3)
-        self.assertEqual(common.CONTROL_TIMEOUT, server_core.CONTROL_TIMEOUT)
+        self.assertEqual(limits.CONTROL_TIMEOUT, server_core.CONTROL_TIMEOUT)
         with patch.object(core, "SHUTDOWN_TIMEOUT", 0.01):
             self.assertEqual(core.SHUTDOWN_TIMEOUT, 0.01)
             self.assertEqual(limits.SHUTDOWN_TIMEOUT, 3)
@@ -77,8 +71,6 @@ class RefactoringTests(unittest.TestCase):
             tcp.write_tcp,
             tcp.TCPReader.__init__,
             tcp.TCPReader.read,
-            udp.get_key,
-            udp.cipher,
             udp.encode_udp,
             udp.decode_udp,
             security.Channel.__init__,
@@ -138,8 +130,6 @@ class RefactoringTests(unittest.TestCase):
                     sys.executable,
                     "-c",
                     "from collab.web.handlers import PAGE, STATIC_DIR; "
-                    "from collab.webui import PAGE as LEGACY; "
-                    "assert PAGE == LEGACY; "
                     "assert '/static/app.js' in PAGE; "
                     "assert (STATIC_DIR / 'style.css').is_file()",
                 ],

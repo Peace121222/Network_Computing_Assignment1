@@ -139,7 +139,6 @@ class Server:
         self._run_id = None
         self._started = threading.Event()
         self._shutdown_requested = threading.Event()
-        self._cleanup_active = threading.Event()
         self.users = {}
         self.connections = set()
         self.running = threading.Event()
@@ -218,24 +217,19 @@ class Server:
         return run
 
     def supervise(self):
+        """Close resources after a worker failure, unless another closer owns shutdown."""
         self._started.wait()
         self._shutdown_requested.wait()
-        while True:
-            # A closer holding the lifecycle lock will join us; never wait on it.
-            if self._cleanup_active.is_set():
-                return
-            if self._lifecycle_lock.acquire(False):
+        if not self._lifecycle_lock.acquire(False):
+            return
+        try:
+            if self.status != "stopped":
                 try:
-                    if self.status != "stopped":
-                        try:
-                            self._stop()
-                        except RuntimeError:
-                            log.exception("Supervisor cleanup incomplete")
-                finally:
-                    self._lifecycle_lock.release()
-                return
-            if self._cleanup_active.wait(0.01):
-                return
+                    self._stop()
+                except RuntimeError:
+                    log.exception("Server cleanup incomplete")
+        finally:
+            self._lifecycle_lock.release()
 
     def _start_thread(self, target, args=(), group=None, *, critical=False):
         entry = self._guard_worker(target) if critical else target
@@ -249,7 +243,7 @@ class Server:
             self.threads.append(thread)
             if group is not None:
                 group.add(thread)
-            # Registration and start are atomic with respect to shutdown snapshots.
+
             try:
                 thread.start()
             except BaseException:
@@ -342,9 +336,8 @@ class Server:
     def _stop(self, deadline=None):
         """Release server resources while retaining failures for a cleanup retry.
 
-        The caller owns the lifecycle lock. The cleanup flag lets the supervisor exit
-        without waiting on that lock. Registry snapshots are taken under the registry
-        lock; sockets are closed and workers joined after releasing it.
+        The caller owns the lifecycle lock. Registry snapshots are taken under the
+        registry lock; sockets are closed and workers joined after releasing it.
 
         Args:
             deadline: Absolute monotonic deadline in seconds, or None for the default.
@@ -354,66 +347,60 @@ class Server:
         """
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
         cleanup = Cleanup()
-        self._cleanup_active.set()
         self._request_stop()
         self._started.set()
-        try:
-            connections, sessions = [], []
-            locked = self.lock.acquire(timeout=max(0, deadline - time.monotonic()))
-            if locked:
-                try:
-                    connections, sessions = list(self.connections), list(
-                        self.users.values()
-                    )
-                    self.revision += sum(u["ready"] for u in sessions)
-                    self.users.clear()
-                    self.pending.clear()
-                    self.chat_records.clear()
-                    self.file_transfers.records.clear()
-                finally:
-                    self.lock.release()
-            else:
-                cleanup.errors.append(("registry", RuntimeError("registry lock busy")))
-            sockets = (
-                [self.tcp, self.udp]
-                + connections
-                + [u["sock"] for u in sessions]
-                + self._retired_sockets
-            )
-            unique = {id(sock): sock for sock in sockets if sock is not None}
-            for sock in unique.values():
-                before = len(cleanup.errors)
-                cleanup.attempt("socket", self._close_socket, sock)
-                if len(cleanup.errors) != before:
-                    if sock not in self._retired_sockets:
-                        self._retired_sockets.append(sock)
-                elif sock in self._retired_sockets:
-                    self._retired_sockets.remove(sock)
-            for user in sessions:
-                if "writer_stop" in user:
-                    user["writer_stop"].set()
-            current = threading.current_thread()
-            for thread in list(self.threads):
-                if thread is not current and thread.ident is not None:
-                    cleanup.attempt(
-                        "worker join", thread.join, max(0, deadline - time.monotonic())
-                    )
-            # Lifecycle ownership excludes new registration after stopping was set.
-            self.threads = [t for t in self.threads if t.is_alive()]
-            if any(t is not current for t in self.threads):
-                cleanup.errors.append(
-                    ("workers", RuntimeError("workers still running"))
+        connections, sessions = [], []
+        locked = self.lock.acquire(timeout=max(0, deadline - time.monotonic()))
+        if locked:
+            try:
+                connections, sessions = list(self.connections), list(
+                    self.users.values()
                 )
-            if not cleanup.errors:
-                self.connections.clear()
-                self.handler_threads.clear()
-                self.writer_threads.clear()
-                self.background_threads.clear()
-                self.tcp = self.udp = None
-                self.status = "stopped"
-            cleanup.finish("Server shutdown incomplete")
-        finally:
-            self._cleanup_active.clear()
+                self.revision += sum(u["ready"] for u in sessions)
+                self.users.clear()
+                self.pending.clear()
+                self.chat_records.clear()
+                self.file_transfers.records.clear()
+            finally:
+                self.lock.release()
+        else:
+            cleanup.errors.append(("registry", RuntimeError("registry lock busy")))
+        sockets = (
+            [self.tcp, self.udp]
+            + connections
+            + [u["sock"] for u in sessions]
+            + self._retired_sockets
+        )
+        unique = {id(sock): sock for sock in sockets if sock is not None}
+        for sock in unique.values():
+            before = len(cleanup.errors)
+            cleanup.attempt("socket", self._close_socket, sock)
+            if len(cleanup.errors) != before:
+                if sock not in self._retired_sockets:
+                    self._retired_sockets.append(sock)
+            elif sock in self._retired_sockets:
+                self._retired_sockets.remove(sock)
+        for user in sessions:
+            if "writer_stop" in user:
+                user["writer_stop"].set()
+        current = threading.current_thread()
+        for thread in list(self.threads):
+            if thread is not current and thread.ident is not None:
+                cleanup.attempt(
+                    "worker join", thread.join, max(0, deadline - time.monotonic())
+                )
+
+        self.threads = [t for t in self.threads if t.is_alive()]
+        if any(t is not current for t in self.threads):
+            cleanup.errors.append(("workers", RuntimeError("workers still running")))
+        if not cleanup.errors:
+            self.connections.clear()
+            self.handler_threads.clear()
+            self.writer_threads.clear()
+            self.background_threads.clear()
+            self.tcp = self.udp = None
+            self.status = "stopped"
+        cleanup.finish("Server shutdown incomplete")
 
     def close(self) -> None:
         """Stop listeners and sessions and join workers within the shutdown deadline.
@@ -626,7 +613,7 @@ class Server:
                     selected_key = None
                     if ready is not None and (chat_streak < 3 or not control_ready):
                         selected_key, msg = ready
-                        # Keep the reserved slot until the final result is written.
+
                         mailbox[selected_key] = None
                         chat_streak += 1
                     elif control_ready:
@@ -1010,7 +997,8 @@ class Server:
 
         The public prefix selects a candidate cipher but is not trusted as authentication.
         Invalid, stale, replayed, and oversize messages are discarded. New endpoints must
-        complete a path challenge before application traffic can refresh heartbeat state.
+        complete an initial path challenge before application traffic can refresh heartbeat state.
+        The verified endpoint stays fixed until the client logs in again.
 
         Args:
             raw: Received datagram bytes, including the public lookup prefix.
@@ -1044,6 +1032,8 @@ class Server:
             security = user.get("udp_security")
             if security is None:
                 return
+            if user["udp_addr"] is not None and user["udp_addr"] != addr:
+                return
             try:
                 security.accept(record)
             except ValueError:
@@ -1062,7 +1052,7 @@ class Server:
                         changed = user["udp_addr"] != addr
                         user["udp_addr"] = addr
                         user.pop("udp_candidate", None)
-                    # Path validation alone never extends the session.
+
                 elif user["udp_addr"] != addr:
                     if (
                         now

@@ -65,7 +65,7 @@ class Client(RealClient):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("cafile", str(ROOT / "ca.crt"))
         super().__init__(*args, **kwargs)
-        # Unit fixtures that do not connect still exercise packet encoding.
+
         from cryptography.fernet import Fernet
 
         self.f = Fernet(Fernet.generate_key())

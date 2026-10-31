@@ -15,7 +15,9 @@ from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
 from tests.auth_support import Client, TransferCapacityError
-from collab.common import b64, encode_udp, recv_tcp, send_tcp
+from collab.shared.protocol import b64
+from collab.transport.udp import encode_udp
+from collab.transport.tcp import recv_tcp, send_tcp
 from collab.shared.concurrency import BoundedExecutor
 from tests.auth_support import Server
 from collab.transport.security import Channel
@@ -51,9 +53,8 @@ class PoolTests(unittest.TestCase):
                 lease = pool.reserve()
                 pool.submit(lease, lambda: None, lambda i=i: cleaned.append(i))
             self.assertIsNone(pool.reserve())
-            self.assertEqual(len(pool.waiting), 4)
+            self.assertEqual(pool.admitted, 6)
             pool.stop()
-            self.assertFalse(pool.waiting)
             self.assertEqual(set(cleaned), set())
             release.set()
             pool.close()
@@ -63,6 +64,26 @@ class PoolTests(unittest.TestCase):
         finally:
             release.set()
             pool.close()
+
+    def test_job_failure_releases_capacity_and_worker_runs_the_next_job(self):
+        pool = BoundedExecutor(1, 1)
+        failed_cleanup = threading.Event()
+        completed = threading.Event()
+        cleanup = Mock(side_effect=failed_cleanup.set)
+        try:
+            with self.assertLogs("collab.shared.concurrency", level="ERROR"):
+                pool.submit(
+                    pool.reserve(), Mock(side_effect=ValueError("bad job")), cleanup
+                )
+                self.assertTrue(failed_cleanup.wait(1))
+            wait_for(self, lambda: pool.admitted == 0)
+            pool.submit(pool.reserve(), completed.set)
+            self.assertTrue(completed.wait(1))
+            wait_for(self, lambda: pool.admitted == 0)
+            cleanup.assert_called_once_with()
+        finally:
+            pool.close()
+        self.assertFalse(any(t.is_alive() for t in pool.threads))
 
     def test_pool_start_failure_rolls_back(self):
         original = threading.Thread.start
@@ -367,7 +388,7 @@ class ConcurrencyNetworkTests(unittest.TestCase):
                         for e in list(b.events.queue)
                     ),
                 )
-                # Server-side removal stops the session without waiting for disk work.
+
                 self.server.remove_session("bob", b.token)
                 wait_for(self, lambda: b.status == "disconnected")
                 with patch("collab.client.core.SHUTDOWN_TIMEOUT", 0.05):
@@ -515,7 +536,7 @@ class AdmissionUnitTests(unittest.TestCase):
         self.assertEqual(len(self.server.pending), 2)
 
     def test_retransmission_batch_is_fair_and_send_does_not_hold_registry(self):
-        # A pre-opened congestion window isolates scheduler batching from startup.
+
         from collab.transport.congestion import CubicController
 
         congestion = CubicController(max_window=512, clock=lambda: 1)

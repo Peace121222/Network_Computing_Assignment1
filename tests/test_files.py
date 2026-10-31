@@ -499,10 +499,10 @@ class FileNetworkTests(unittest.TestCase):
                     return False
             if msg["type"] == "ack":
                 counts["source_ack"] += 1
-                return False  # Final status must also supersede missing end ACK.
+                return False
             return send(raw, sessions, address)
 
-        # Drop only the end ingress ACK; earlier packet ACKs must advance sender.
+
         def selective(raw, sessions, address=None):
             msg = raw
             if msg["type"] == "ack":

@@ -29,8 +29,8 @@ class ChatInbox:
         while self.seen and next(iter(self.seen.values())) <= now:
             key, _ = self.seen.popitem(last=False)
             self.fingerprints.pop(key, None)
-        # Keep sequence watermarks for live peers even when replay entries expire.
-        # Resetting next=1 after an idle minute would strand higher sequence numbers.
+
+
         for key, stream in list(self.streams.items()):
             if stream.get("retired") and not stream["buffer"]:
                 del self.streams[key]
@@ -135,11 +135,11 @@ class ChatInbox:
         fingerprint = (msg["from"], msg["payload"], meta["channel"], meta["sequence"])
         cached = self.seen.get(message_key)
         if cached is not None:
-            # Expiry is stored separately; a duplicate cannot change original contents.
+
             return self.fingerprints[message_key] == fingerprint
         stream = self.streams.get(key)
         if stream is None:
-            # A server-assigned epoch change supersedes an old, empty stream.
+
             for old_key, old in list(self.streams.items()):
                 if old_key[0] == key[0] and old_key[1] != key[1] and not old["buffer"]:
                     del self.streams[old_key]
@@ -149,10 +149,10 @@ class ChatInbox:
             self.streams[key] = stream
         seq = meta["sequence"]
         if seq < stream["next"]:
-            return True  # Already displayed or deliberately skipped.
+            return True
         if seq >= stream["next"] + CHAT_STREAM_WINDOW:
-            # Do not retain or ACK an out-of-window payload. Remember only a bounded
-            # sequence hint so a long run of missing packets cannot strand the stream.
+
+
             if not stream["buffer"]:
                 if stream["gap_since"] is None:
                     stream["gap_since"] = now

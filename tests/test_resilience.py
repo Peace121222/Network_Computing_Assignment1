@@ -705,38 +705,26 @@ class CleanupTests(unittest.TestCase):
             pool.close()
         self.assertEqual(pool.admitted, 0)
 
-    def test_failed_cancelled_cleanup_is_retained_and_retried_once(self):
+    def test_failed_cancelled_cleanup_is_reported_without_retry(self):
         pool = BoundedExecutor(1, 1)
-        entered, release, failed = (
-            threading.Event(),
-            threading.Event(),
-            threading.Event(),
-        )
+        entered, release = threading.Event(), threading.Event()
 
         def active():
             entered.set()
             release.wait(2)
 
-        attempts = []
-
-        def cleanup():
-            attempts.append(1)
-            if len(attempts) == 1:
-                failed.set()
-                raise OSError("disk busy")
-
+        cleanup = Mock(side_effect=OSError("disk busy"))
+        never_run = Mock()
         pool.submit(pool.reserve(), active)
         self.assertTrue(entered.wait(1))
         lease = pool.reserve()
-        never_run = Mock()
         pool.submit(lease, never_run, cleanup)
         with self.assertLogs("collab.shared.concurrency", level="ERROR"):
             pool.stop()
             release.set()
-            self.assertTrue(failed.wait(1))
-            wait(self, lambda: bool(pool.failed_cleanup))
-        pool.close()
-        self.assertEqual(len(attempts), 2)
+            with self.assertRaisesRegex(RuntimeError, "shutdown incomplete"):
+                pool.close()
+        cleanup.assert_called_once_with()
         self.assertTrue(lease.released)
         self.assertEqual(pool.admitted, 0)
         never_run.assert_not_called()

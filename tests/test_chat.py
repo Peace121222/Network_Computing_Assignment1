@@ -16,7 +16,8 @@ from unittest.mock import Mock, patch
 from cryptography.fernet import Fernet
 from collab.client.chat_inbox import ChatInbox
 from tests.auth_support import Client
-from collab.common import encode_udp, decode_udp, validate_tcp, validate_udp
+from collab.transport.udp import encode_udp, decode_udp
+from collab.shared.protocol import validate_tcp, validate_udp
 from collab.transport.security import Channel
 from tests.auth_support import Server
 
@@ -133,7 +134,7 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(self.events[-1]["text"], "text-100")
 
     def test_ciphertext_size_estimate_matches_actual_fernet_padding(self):
-        from collab.common import udp_frame_size
+        from collab.transport.udp import udp_frame_size
 
         cipher = Fernet(Fernet.generate_key())
         for count in range(100):
@@ -407,7 +408,7 @@ class ChatServerTests(unittest.TestCase):
         self.assertEqual(len(self.server.pending), 8)
 
     def test_weighted_schedule_uses_96_chat_and_32_file_slots(self):
-        # A pre-opened congestion window isolates scheduler batching from startup.
+
         from collab.transport.congestion import CubicController
 
         congestion = CubicController(max_window=512, clock=lambda: 100)
@@ -590,7 +591,7 @@ class ChatNetworkTests(unittest.TestCase):
             first = pool.submit(a.chat, "bob", "first")
             wait_for(self, lambda: bool(held))
             second = pool.submit(a.chat, "bob", "second")
-            second.result(2)  # Accepted into reorder buffer, even before display.
+            second.result(2)
             original(*held[0])
             first.result(2)
         wait_for(

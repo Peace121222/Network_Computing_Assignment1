@@ -12,7 +12,9 @@ from unittest.mock import Mock, patch
 from cryptography.fernet import Fernet
 from tests.auth_support import Client
 from tests.auth_support import Server
-from collab.common import encode_udp, send_tcp, recv_tcp, validate_tcp, validate_udp
+from collab.transport.udp import encode_udp
+from collab.transport.tcp import send_tcp, recv_tcp
+from collab.shared.protocol import validate_tcp, validate_udp
 from collab.transport.security import Channel
 from tests.auth_support import client_login, tls_connection
 
@@ -83,19 +85,17 @@ class SessionUnitTests(unittest.TestCase):
                 ):
                     Server(**{field: value})
 
-    def test_endpoint_change_requires_challenge_without_revision_change(self):
+    def test_endpoint_change_requires_a_new_login(self):
+        old = self.a["udp_addr"]
         new = ("127.0.0.1", 2000)
         self.receive(self.packet(), address=new)
-        self.assertEqual(self.a["udp_addr"], ("127.0.0.1", 1001))
+        self.assertEqual(self.a["udp_addr"], old)
         self.assertEqual(self.a["last_seen"], 100)
-        challenge = self.a["udp_candidate"]["nonce"]
-        self.receive(self.packet("path_response", nonce=challenge), address=new)
-        self.assertEqual(self.a["udp_addr"], new)
-        self.assertEqual(self.a["last_seen"], 100)
-        self.receive(self.packet(), address=new)
+        self.assertNotIn("udp_candidate", self.a)
+        self.assertEqual(self.a["udp_security"].highest, 0)
+        self.server.udp.sendto.assert_not_called()
+        self.receive(self.packet(), address=old)
         self.assertEqual(self.a["last_seen"], 105)
-        self.assertEqual(self.server.revision, 0)
-        self.assertTrue(self.server.presence_dirty.is_set())
 
     def test_invalid_or_old_token_and_malformed_packet_change_nothing(self):
         for msg in (
@@ -355,52 +355,46 @@ class SessionNetworkTests(unittest.TestCase):
         self.assertEqual(client.status, "connected")
         self.assertEqual(self.server.users["alice"]["udp_addr"], before)
 
-    def test_valid_udp_endpoint_change_preserves_revision(self):
+    def test_changed_udp_endpoint_is_rejected_until_a_new_login(self):
         client = self.client("alice", heartbeat=False)
         self.wait(lambda: client.names == ["alice"])
         revision = self.server.revision
+        old_endpoint = self.server.users["alice"]["udp_addr"]
+        old_token = client.token
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.bind(("127.0.0.1", 0))
-            sock.settimeout(1)
+            sock.settimeout(0.15)
             packet = {"type": "heartbeat", "from": "alice", "token": client.token}
-            security = client._session["udp_security"]
-            from collab.transport.udp import decode_udp
-
-            sock.settimeout(0.1)
-            deadline = time.monotonic() + 2
-            while True:
-                sock.sendto(
-                    encode_udp(packet, self.server.f, security),
-                    ("127.0.0.1", self.server.udp_port),
-                )
-                try:
-                    challenge = decode_udp(
-                        sock.recvfrom(4096)[0], self.server.f, security
-                    )
-                    break
-                except socket.timeout:
-                    if time.monotonic() >= deadline:
-                        raise
-            self.assertEqual(challenge["type"], "path_challenge")
-            response = dict(packet, type="path_response", nonce=challenge["nonce"])
             sock.sendto(
-                encode_udp(response, self.server.f, security),
+                encode_udp(packet, client.f, client._session["udp_security"]),
                 ("127.0.0.1", self.server.udp_port),
             )
-            self.wait(
-                lambda: self.server.users["alice"]["udp_addr"] == sock.getsockname()
-            )
-            self.assertEqual(self.server.revision, revision)
+            with self.assertRaises(socket.timeout):
+                sock.recvfrom(4096)
+        self.assertEqual(self.server.users["alice"]["udp_addr"], old_endpoint)
+        self.assertEqual(self.server.revision, revision)
+
+        client.names = []
+        client.send_raw({"type": "heartbeat"})
+        self.wait(lambda: client.names == ["alice"])
+        client.close()
+        self.wait(lambda: "alice" not in self.server.users)
+        client.connect()
+        self.wait(lambda: client.names == ["alice"])
+        self.assertNotEqual(client.token, old_token)
+        self.assertEqual(
+            self.server.users["alice"]["udp_addr"][1], client.udp.getsockname()[1]
+        )
 
     def test_heartbeat_recovers_lost_presence_notification(self):
         client = self.client("alice", heartbeat=False)
         self.wait(lambda: client.names == ["alice"])
-        client.names = []  # Simulate missing the latest membership snapshot.
+        client.names = []
         client.send_raw({"type": "heartbeat"})
         self.wait(lambda: client.names == ["alice"])
 
     def test_twenty_clients_and_oversized_snapshot_falls_back_to_tcp(self):
-        # Unicode names maximize JSON expansion and exceed the UDP ciphertext limit.
+
         names = ["界" * 21 + str(i) for i in range(20)]
         clients = [self.client(name) for name in names]
         expected = sorted(names)
@@ -444,7 +438,7 @@ class SessionNetworkTests(unittest.TestCase):
         original = threading.Thread.start
         count = 0
 
-        # Patch only after accept thread started; identify the client's TCP worker.
+
         def start(thread):
             nonlocal count
             target = getattr(thread, "_target", None)

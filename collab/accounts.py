@@ -1,8 +1,7 @@
-"""Persistent accounts and bounded, expiring authentication throttling."""
+"""Persistent accounts and fixed-window authentication throttling."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Callable, Hashable
 from contextlib import closing
 import sqlite3
@@ -125,15 +124,14 @@ class Accounts:
 
 
 class AuthLimiter:
-    """Track bounded, expiring authentication windows by caller-supplied key.
+    """Track expiring authentication windows by source IP.
 
     The server keys attempts by source IP and counts registration and login attempts,
-    including successes. Entries use fixed windows and least-recently-used eviction.
+    including successes. Expired entries are removed on the next authentication attempt.
 
     Attributes:
         limit: Number of allowed attempts within a window.
         window: Window duration in seconds.
-        capacity: Maximum number of remembered keys.
         clock: Monotonic clock returning seconds.
     """
 
@@ -141,23 +139,16 @@ class AuthLimiter:
         self,
         limit: int = 10,
         window: float = 60,
-        capacity: int = 4096,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.limit, self.window, self.capacity, self.clock = (
-            limit,
-            window,
-            capacity,
-            clock,
-        )
-        self.entries: OrderedDict[Hashable, tuple[float, int]] = OrderedDict()
+        self.limit, self.window, self.clock = limit, window, clock
+        self.entries: dict[Hashable, tuple[float, int]] = {}
         self.lock = threading.Lock()
 
     def allow(self, key: Hashable) -> bool:
         """Count an attempt and check its fixed-window allowance.
 
-        Denied attempts do not extend the window. Updating a key marks it recently used;
-        capacity overflow evicts the least-recently-used entry.
+        Denied attempts do not extend the fixed window.
 
         Args:
             key: Hashable client identity, normally a source IP address.
@@ -170,8 +161,6 @@ class AuthLimiter:
             for previous_key, (window_started_at, _) in list(self.entries.items()):
                 if now - window_started_at >= self.window:
                     del self.entries[previous_key]
-            window_started_at, attempts = self.entries.pop(key, (now, 0))
+            window_started_at, attempts = self.entries.get(key, (now, 0))
             self.entries[key] = (window_started_at, attempts + 1)
-            while len(self.entries) > self.capacity:
-                self.entries.popitem(last=False)
             return attempts < self.limit

@@ -140,8 +140,8 @@ class NetworkTests(unittest.TestCase):
                             rejected_by_schema.set()
                         raise
 
-                # Keep the authenticated envelope valid so rejection must reach
-                # schema validation, rather than merely rejecting an old format.
+
+
                 raw = encode_udp(message, self.a.f, self.a._session["udp_security"])
                 with (
                     self.subTest(message=message),

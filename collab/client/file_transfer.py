@@ -247,7 +247,7 @@ class FileTransfers:
             session["finalize_queue"].put_nowait(("start", key, f))
             return True
         if f is None or f["cancelled"]:
-            return False  # Unknown transfer: do not ACK or poison duplicate memory.
+            return False
         if kind == "file_chunk":
             self.validate_transfer_packet(msg)
             index = meta["index"]
@@ -420,7 +420,7 @@ class FileTransfers:
                             ):
                                 f["written"].add(index)
                                 now = time.monotonic()
-                                # UI samples progress; chunk reliability remains independent.
+
                                 if (
                                     now - f.get("ui_progress_at", float("-inf"))
                                     >= FILE_PROGRESS_INTERVAL
@@ -450,7 +450,7 @@ class FileTransfers:
         except (OSError, ValueError) as exc:
             client._request_disconnect(session, "File control failed: " + str(exc))
         finally:
-            # This worker exclusively owns file descriptors, including after detach.
+
             for f in list(session["file_resources"].values()):
                 self.dispose(f)
             session["file_resources"].clear()

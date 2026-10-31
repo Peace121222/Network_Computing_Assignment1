@@ -1,14 +1,14 @@
 """Protocol sizes, resource limits and timing defaults."""
 
 MAX_FRAME = 2_000_000
-UDP_MTU = 1100  # Includes the public lookup prefix and Fernet overhead.
+UDP_MTU = 1100
 CHUNK = 320
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MAX_CHUNKS = (MAX_FILE_SIZE + CHUNK - 1) // CHUNK
 MAX_USERNAME = 24
 MAX_PACKET_ID = 80
 MAX_FILENAME = 255
-MAX_CHAT_CHARS = 1000  # An additional encrypted-byte limit also applies.
+MAX_CHAT_CHARS = 1000
 MAX_ERROR_CHARS = 120
 SEND_WINDOW = 6
 CLIENT_RETRIES = 15
@@ -96,5 +96,5 @@ FILE_FAILURE_REASONS = frozenset(
 )
 FILE_HASH_BUDGET = (
     64 * 1024 * 1024
-)  # Conservative reservation for per-index replay fingerprints.
+)
 FILE_HASH_ENTRY_BYTES = 256

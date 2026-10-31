@@ -12,6 +12,7 @@ import ssl
 import threading
 import time
 from collections import OrderedDict
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,7 @@ from collab.shared.limits import (
     UDP_TIMEOUT,
 )
 from collab.shared.protocol import data_packet, validate_tcp, validate_udp
+from collab.shared.resilience import Cleanup, RetryDelay, SendBackoff, retryable
 from collab.transport.congestion import CubicController
 from collab.transport.handshake import client_login
 from collab.transport.security import Channel, unseal
@@ -46,14 +48,24 @@ from collab.transport.udp import encode_udp
 
 log = logging.getLogger(__name__)
 
-def retryable(exc, udp=False):
-    err = exc.errno
-    if udp:
-        return err in (errno.EINTR, errno.EAGAIN, errno.EWOULDBLOCK, errno.ECONNRESET, errno.ECONNREFUSED)
-    return err in (errno.EINTR, errno.EAGAIN, errno.EWOULDBLOCK)
-
 
 class Client:
+    """Manage an authenticated client session and its socket workers.
+
+    The lifecycle lock serializes connect/close operations; the state lock protects
+    session identity and send/receive state. Worker callbacks compare session identity
+    and must not wait for a lifecycle owner that may be joining them.
+
+    Attributes:
+        name: Account username sent during authentication.
+        download_dir: Receive directory, created during construction.
+        events: Queue of connection, presence, chat, file, and error events.
+        names: Latest received online-user list.
+        status: Lifecycle status, initially disconnected.
+        f: Active session cipher, or None when reset or disconnected.
+        pending_lock: Lock protecting hop-ACK waiters.
+    """
+
     status: str
 
     def __init__(
@@ -68,12 +80,22 @@ class Client:
         file_idle_timeout: float = FILE_IDLE_TIMEOUT,
         file_transfer_timeout: float = FILE_TRANSFER_TIMEOUT,
     ) -> None:
-        self.file_idle_timeout = file_idle_timeout
-        self.file_transfer_timeout = file_transfer_timeout
+        for value in (file_idle_timeout, file_transfer_timeout):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError("File timeouts must be finite and positive")
+        self.file_idle_timeout, self.file_transfer_timeout = (
+            file_idle_timeout,
+            file_transfer_timeout,
+        )
         self.name, self.host, self.port = name, host, port
         self.f = None
         self.cafile, self.server_name = cafile, server_name or host
-        
+        self._udp_backoff = SendBackoff(log)
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.events = queue.Queue()
@@ -87,14 +109,18 @@ class Client:
         self._file_transfers = FileTransfers(self)
         self.names = []
         self.running = threading.Event()
-        self.tcp = self.udp = self.token = self.address = None
+        self.tcp = None
+        self.udp = None
+        self.token = None
+        self.address = None
         self.threads = []
-        
+        self._retired_sockets = []
         self._lifecycle_lock = threading.Lock()
         self._state_lock = threading.RLock()
         self._session = None
         self.status = "disconnected"
         self.presence_revision = -1
+        self._operation_context = threading.local()
 
     def _set_status(self, status, reason=None):
         if self.status != status:
@@ -105,6 +131,7 @@ class Client:
             self.events.put(event)
 
     def _open_tls(self, deadline: float | None = None) -> ssl.SSLSocket:
+        """Transfer socket ownership to the caller only after TLS succeeds."""
         context = client_context(self.cafile)
         raw = socket.create_connection((self.host, self.port), timeout=CONNECT_TIMEOUT)
         try:
@@ -116,32 +143,65 @@ class Client:
             raise
 
     def register(self, password: str, confirmation: str) -> None:
+        """Register credentials over a short-lived, server-verified TLS connection.
+
+        The connection closes when the exchange finishes. Registration does not log in
+        or start socket workers.
+
+        Args:
+            password: Password containing 8 to 128 characters.
+            confirmation: Exact repeat of password.
+
+        Raises:
+            ValueError: Credentials are invalid or confirmation does not match.
+            RuntimeError: The server rejects registration or returns no success response.
+            OSError: Connection, TLS verification, or socket I/O fails.
+        """
         validate_credentials(self.name, password)
         if password != confirmation:
             raise ValueError("Passwords do not match")
         deadline = time.monotonic() + CLIENT_LOGIN_TIMEOUT
         with self._open_tls(deadline) as sock:
-            send_tcp(sock, dict(type="register", name=self.name, password=password), deadline)
+            send_tcp(
+                sock, dict(type="register", name=self.name, password=password), deadline
+            )
             response = TCPReader(sock).read(deadline)
             if response.get("type") != "registered":
                 raise RuntimeError(response.get("message", "Registration failed"))
 
     def connect(self, password: str | None = None) -> None:
+        """Authenticate and start the workers owned by a new session.
+
+        Partial setup is rolled back on failure. An earlier session's workers must finish
+        before a new connection can start. No automatic reconnect is performed.
+
+        Args:
+            password: Account password. None is rejected by credential validation.
+
+        Raises:
+            ValueError: The username/password or server response is invalid.
+            RuntimeError: A lifecycle operation is active, workers remain, or login fails.
+            OSError: TCP, TLS verification, or UDP setup fails, including timeouts.
+        """
         if not self._lifecycle_lock.acquire(blocking=False):
             raise RuntimeError("Client is already connecting or closing")
         try:
             if self.tcp is not None or self.status != "disconnected":
-                raise RuntimeError("Client is already connected")
-                
+                raise RuntimeError("Client is already connected or still closing")
+            self._join_workers()
+            if any(t.is_alive() for t in self.threads):
+                raise RuntimeError("Previous client workers are still closing")
             validate_credentials(self.name, password)
             self._reset_session(clear_events=True)
+            self._udp_backoff.reset()
             self._set_status("connecting")
-            
             session = {
-                "id": object(), "congestion": CubicController(),
+                "id": object(),
+                "congestion": CubicController(),
                 "stop": threading.Event(),
                 "finalize_queue": queue.Queue(maxsize=FILE_WRITE_QUEUE),
-                "file_resources": {}, "receipts": {},
+                "file_resources": {},
+                "receipts": {},
                 "tcp_send_lock": threading.Lock(),
             }
             self._session = session
@@ -149,16 +209,19 @@ class Client:
                 reader = self._establish_session(session, password)
                 self._start_session_workers(session, reader)
             except BaseException:
-                self._cleanup(logout=False)
+                try:
+                    self._cleanup(logout=False)
+                except Exception:
+                    log.exception("Connection rollback incomplete")
                 raise
         finally:
             self._lifecycle_lock.release()
 
     def _establish_session(self, session: dict[str, Any], password: str) -> TCPReader:
+        """Attach TLS/UDP resources before I/O so failed setup can close them."""
         deadline = time.monotonic() + CLIENT_LOGIN_TIMEOUT
         self.tcp = self._open_tls(deadline)
         session["tcp"] = self.tcp
-        
         welcome, reader = client_login(self.tcp, self.name, password, deadline)
         self.f = reader.security.f
         session["tcp_security"] = reader.security
@@ -167,7 +230,6 @@ class Client:
         self.address = (self.tcp.getpeername()[0], welcome["udp_port"])
         self.tcp.setblocking(False)
         reader.wait_timeout = SESSION_TIMEOUT
-        
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         session["udp"] = self.udp
         self.udp.bind(("0.0.0.0", 0))
@@ -175,50 +237,63 @@ class Client:
         self.send_raw({"type": "heartbeat"})
         return reader
 
-    def _start_session_workers(self, session: dict[str, Any], reader: TCPReader) -> None:
-        self.running.set()
-        
-        def run_worker(target, *args):
-            try:
-                target(*args)
-            except Exception as exc:
-                if self._session is session and not session["stop"].is_set():
-                    self._request_disconnect(session, f"Worker failed: {exc}")
-                    
+    def _start_session_workers(
+        self, session: dict[str, Any], reader: TCPReader
+    ) -> None:
+        """Publish connected status only after every owned worker starts."""
         self.threads = [
-            threading.Thread(target=run_worker, args=(self.listen, session), daemon=True),
-            threading.Thread(target=run_worker, args=(self.heartbeats, session), daemon=True),
-            threading.Thread(target=run_worker, args=(self.listen_tcp, session, reader), daemon=True),
-            threading.Thread(target=run_worker, args=(self.finalize_worker, session), daemon=True),
+            threading.Thread(
+                target=self._guard_worker(self.listen, session),
+                args=(session,),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._guard_worker(self.heartbeats, session),
+                args=(session,),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._guard_worker(self.listen_tcp, session),
+                args=(session, reader),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._guard_worker(self.finalize_worker, session),
+                args=(session,),
+                daemon=True,
+            ),
         ]
-        for t in self.threads:
-            t.start()
-            
+        self.running.set()
+        # Workers wait until all starts succeed, preventing callbacks during rollback.
+        session["started"] = threading.Event()
+        for thread in self.threads:
+            thread.start()
         with self._state_lock:
             self._set_status("connected")
+        session["started"].set()
 
     def _reset_session(self, *, clear_events=False):
-        self.token = self.f = self.address = None
+        self.token = None
+        self.f = None
+        self.address = None
         self.names = []
         self.presence_revision = -1
         self.messages_seen.clear()
         self.chat_inbox = ChatInbox(self.events.put)
-        
         for mid, record in self.outgoing_chats.items():
             if not record["reported"]:
                 record["reported"] = True
-                self.events.put({"type": "chat_send_failed", "id": mid, "reason": "session_ended"})
+                self.events.put(
+                    {"type": "chat_send_failed", "id": mid, "reason": "session_ended"}
+                )
             record["done"].set()
-            
         self.outgoing_chats.clear()
         self._file_transfers.reset()
         self.files.clear()
-        
         with self.pending_lock:
             self.pending.clear()
-            
         if clear_events:
-            while not self.events.empty():
+            while True:
                 try:
                     self.events.get_nowait()
                 except queue.Empty:
@@ -226,79 +301,218 @@ class Client:
 
     @staticmethod
     def _close_socket(sock):
-        if sock:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                sock.close()
-            except OSError:
-                pass
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+        try:
+            sock.close()
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+
+    def _join_workers(self, deadline=None):
+        """Join owned workers and retry deferred resource cleanup.
+
+        The caller owns the lifecycle lock and must not hold the state lock. The current
+        thread and unstarted threads are not joined; unfinished resources remain available
+        for a later cleanup attempt.
+
+        Args:
+            deadline: Absolute monotonic deadline in seconds, or None for the default.
+
+        Raises:
+            RuntimeError: Workers, files, or sockets cannot be fully cleaned up.
+        """
+        current = threading.current_thread()
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
+        cleanup = Cleanup()
+        for thread in self.threads:
+            if thread is not current and thread.ident is not None:
+                cleanup.attempt(
+                    "worker join", thread.join, max(0, deadline - time.monotonic())
+                )
+        self.threads = [t for t in self.threads if t.is_alive()]
+        if any(t is not current for t in self.threads):
+            cleanup.errors.append(("workers", RuntimeError("worker still running")))
+        else:
+            cleanup.attempt("files", self._file_transfers.retry_cleanup)
+        for sock in list(self._retired_sockets):
+            before = len(cleanup.errors)
+            cleanup.attempt("socket", self._close_socket, sock)
+            if len(cleanup.errors) == before:
+                self._retired_sockets.remove(sock)
+        cleanup.finish("Client shutdown incomplete")
 
     def _detach_session(self, reason=None):
+        """Detach the current session and close its sockets without joining workers.
+
+        The caller must hold the state lock. Pending jobs are cancelled, session state is
+        reset, and connection/presence events are emitted. Existing queued events survive;
+        failed socket closes are retained for retry.
+
+        Args:
+            reason: Optional disconnect reason included in connection and error events.
+        """
         session = self._session
         if session is not None:
             session["stop"].set()
             jobs = session.get("finalize_queue")
-            if jobs:
-                while not jobs.empty():
+            if jobs is not None:
+                while True:
                     try:
                         jobs.get_nowait()
                         jobs.task_done()
                     except queue.Empty:
                         break
-                        
+            if "started" in session:
+                session["started"].set()
         self.running.clear()
-        self._close_socket(self.tcp)
-        self._close_socket(self.udp)
-        self.tcp = self.udp = self._session = None
-        
+        for sock in (self.tcp, self.udp):
+            if sock is None:
+                continue
+            try:
+                self._close_socket(sock)
+            except Exception as exc:
+                if sock not in self._retired_sockets:
+                    self._retired_sockets.append(sock)
+                self.events.put(
+                    {"type": "error", "message": "Socket cleanup failed: " + str(exc)}
+                )
+        self.tcp = self.udp = None
+        self._session = None
         self._reset_session()
         self._set_status("disconnected", reason)
         self.events.put({"type": "presence", "names": []})
-        if reason:
+        if reason is not None:
             self.events.put({"type": "error", "message": reason})
 
-    def _cleanup(self, *, logout):
-        with self._state_lock:
-            if logout and self.tcp and self.token:
+    def _cleanup(self, *, logout, deadline=None):
+        """Detach a session and join its workers within one cleanup deadline.
+
+        The caller owns the lifecycle lock. State is detached under the state lock, which
+        is released before joining workers.
+
+        Args:
+            logout: Whether to attempt a logout control message before detaching.
+            deadline: Absolute monotonic deadline in seconds, or None for the default.
+
+        Raises:
+            RuntimeError: The state lock or resource cleanup cannot complete in time.
+        """
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT if deadline is None else deadline
+        cleanup = Cleanup()
+        if not self._state_lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise RuntimeError("Client shutdown incomplete: state lock busy")
+        try:
+            if logout and self.tcp is not None and self.token is not None:
                 try:
-                    self.send_control({"type": "logout"}, self._session)
+                    self.send_control(
+                        {"type": "logout"}, self._session, deadline=deadline
+                    )
                 except (OSError, ValueError):
                     pass
-            self._detach_session()
-            
-        current = threading.current_thread()
-        for thread in self.threads:
-            if thread is not current and thread.is_alive():
-                thread.join(timeout=1.0)
-        self.threads.clear()
+            cleanup.attempt("session", self._detach_session)
+        finally:
+            self._state_lock.release()
+        cleanup.attempt("workers and files", self._join_workers, deadline)
+        cleanup.finish("Client shutdown incomplete")
 
     def _request_disconnect(self, session, reason):
+        """Detach a matching worker session without joining its workers.
+
+        The state lock is acquired internally. Calls from a retired or stopped session
+        have no effect.
+
+        Args:
+            session: Session captured when the worker started.
+            reason: Disconnect reason emitted with client events.
+        """
         with self._state_lock:
             if self._session is session and not session["stop"].is_set():
                 self._detach_session(reason)
 
-    def close(self) -> None:
+    def _guard_worker(self, target, session):
+        @wraps(target)
+        def run(*args):
+            if not self._worker_ready(session):
+                return
+            try:
+                target(*args)
+                if self._session is session and not session["stop"].is_set():
+                    raise RuntimeError("Worker returned unexpectedly")
+            except BaseException as exc:
+                if self._session is session and not session["stop"].is_set():
+                    self._request_disconnect(
+                        session, "Client worker failed: " + str(exc)
+                    )
+                    log.exception(
+                        "Client worker %s failed",
+                        getattr(target, "__name__", "unknown"),
+                    )
+
+        run.__self__ = self
+        return run
+
+    def _close_before(self, deadline):
+        # A worker must not wait for a lifecycle owner that may be joining it.
         if threading.current_thread() in self.threads:
             with self._state_lock:
                 self._detach_session()
             return
-            
-        if not self._lifecycle_lock.acquire(timeout=SHUTDOWN_TIMEOUT):
-            return
+        if not self._lifecycle_lock.acquire(
+            timeout=max(0, deadline - time.monotonic())
+        ):
+            raise RuntimeError("Client shutdown incomplete: lifecycle lock busy")
         try:
-            self._cleanup(logout=True)
+            self._cleanup(logout=True, deadline=deadline)
         finally:
             self._lifecycle_lock.release()
 
-    def send_control(self, message: dict[str, Any], session: dict[str, Any] | None, *, deadline: float | None = None) -> None:
+    def close(self) -> None:
+        """End the session and release client-owned sockets, workers, and files.
+
+        Worker callers detach without waiting for a lifecycle owner. Other callers attempt
+        logout and join workers within the configured shutdown timeout.
+
+        Raises:
+            RuntimeError: Lifecycle ownership or resource cleanup cannot complete in time.
+        """
+        self._close_before(time.monotonic() + SHUTDOWN_TIMEOUT)
+
+    def send_control(
+        self,
+        message: dict[str, Any],
+        session: dict[str, Any] | None,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        """Send a validated TCP control message for the specified active session.
+
+        The session write lock serializes control frames. The effective deadline is capped
+        at LOGOUT_TIMEOUT seconds from the call, including the lock wait.
+
+        Args:
+            message: Client-to-server control message.
+            session: Expected active session; None indicates an ended session.
+            deadline: Optional absolute monotonic deadline in seconds.
+
+        Raises:
+            ValueError: The message violates the control schema.
+            ConnectionError: The expected session is absent, stopped, or replaced.
+            TimeoutError: The write lock or socket write exceeds its deadline.
+            OSError: Socket I/O fails.
+        """
         validate_tcp(message, from_client=True)
         if session is None:
             raise ConnectionError("Client session ended")
-            
-        deadline = (time.monotonic() + LOGOUT_TIMEOUT) if deadline is None else deadline
+        deadline = (
+            min(time.monotonic() + LOGOUT_TIMEOUT, deadline)
+            if deadline is not None
+            else time.monotonic() + LOGOUT_TIMEOUT
+        )
         lock = session["tcp_send_lock"]
         if not lock.acquire(timeout=max(0, deadline - time.monotonic())):
             raise TimeoutError("TCP control writer busy")
@@ -309,46 +523,103 @@ class Client:
             if hasattr(sock, "fileno"):
                 write_tcp(sock, message, deadline, security=session["tcp_security"])
             else:
-                send_tcp(sock, message, deadline=deadline, security=session["tcp_security"])
+                send_tcp(
+                    sock, message, deadline=deadline, security=session["tcp_security"]
+                )
         finally:
             lock.release()
 
     def send_raw(self, message: dict[str, Any]) -> None:
+        """Send one authenticated UDP message using the current session.
+
+        A copy of message receives the current username and token before validation.
+        No ACK wait is performed; transient failures update the UDP send backoff.
+
+        Args:
+            message: Client UDP message without required session identity fields.
+
+        Raises:
+            ConnectionError: The client has no active UDP socket or token.
+            ValueError: The message schema or encrypted datagram size is invalid.
+            BlockingIOError: UDP send backoff has not expired.
+            OSError: The socket send fails.
+        """
         with self._state_lock:
             if self.udp is None or self.token is None:
                 raise ConnectionError("Client is disconnected")
             packet = dict(message, **{"from": self.name, "token": self.token})
             validate_udp(packet, from_client=True)
             raw = encode_udp(packet, self.f, self._session["udp_security"])
+            if not self._udp_backoff.ready():
+                raise BlockingIOError(errno.EAGAIN, "UDP retry backoff")
             try:
                 self.udp.sendto(raw, self.address)
             except OSError as exc:
-                if not retryable(exc, udp=True):
-                    raise
+                if retryable(exc, udp=True):
+                    self._udp_backoff.failed(exc)
+                raise
+            self._udp_backoff.reset()
 
-    def heartbeats(self, session):
-        while self.running.is_set() and not session["stop"].is_set():
+    def _worker_ready(self, session):
+        if session is None:
+            return True
+        session["started"].wait()
+        return not session["stop"].is_set()
+
+    def heartbeats(self, session=None):
+        if not self._worker_ready(session):
+            return
+        delay = RetryDelay(
+            session["stop"] if session is not None else threading.Event(),
+            log,
+            "UDP heartbeat",
+            log_errors=False,
+        )
+        while self.running.is_set() and (
+            session is None or not session["stop"].is_set()
+        ):
             try:
                 with self._state_lock:
-                    if self._session is not session:
+                    if session is not None and self._session is not session:
                         return
                     self.send_raw({"type": "heartbeat"})
             except OSError as exc:
                 if retryable(exc, udp=True):
-                    time.sleep(0.5)
+                    delay.wait(exc)
                     continue
-                self._request_disconnect(session, str(exc))
+                if session is not None:
+                    self._request_disconnect(session, str(exc))
                 return
-            session["stop"].wait(HEARTBEAT_INTERVAL)
+            delay.reset()
+            if session is not None:
+                session["stop"].wait(HEARTBEAT_INTERVAL)
+            else:
+                time.sleep(HEARTBEAT_INTERVAL)
 
     def _apply_presence(self, msg):
+        """Apply an online-user snapshot whose revision is not older than local state.
+
+        The caller must hold the state lock. Both TCP and UDP receivers use this path;
+        accepted snapshots update peer tracking and emit a presence event.
+
+        Args:
+            msg: Validated presence or users message containing names and revision.
+        """
         if msg["revision"] >= self.presence_revision:
             self.presence_revision = msg["revision"]
             self.names = list(msg["names"])
             self.chat_inbox.set_peers(self.names)
-            self.events.put({"type": "presence", "names": self.names, "revision": self.presence_revision})
+            self.events.put(
+                {
+                    "type": "presence",
+                    "names": self.names,
+                    "revision": self.presence_revision,
+                }
+            )
 
     def listen_tcp(self, session, reader):
+        if not self._worker_ready(session):
+            return
         try:
             while not session["stop"].is_set():
                 try:
@@ -356,6 +627,13 @@ class Client:
                 except socket.timeout:
                     continue
                 validate_tcp(msg, from_client=False)
+                if msg["type"] not in {
+                    "users",
+                    "chat_status",
+                    "file_status",
+                    "file_cancel",
+                }:
+                    raise ValueError("Unexpected TCP control message after login")
                 with self._state_lock:
                     if self._session is not session:
                         return
@@ -368,48 +646,68 @@ class Client:
                     else:
                         self._file_transfers.cancel(msg, session)
         except (OSError, ValueError) as exc:
-            self._request_disconnect(session, f"Server connection lost: {exc}")
+            self._request_disconnect(session, "Server connection lost: " + str(exc))
 
-    def listen(self, session):
-        udp = session["udp"]
-        while self.running.is_set() and not session["stop"].is_set():
+    def listen(self, session=None):
+        if not self._worker_ready(session):
+            return
+        udp = self.udp if session is None else session["udp"]
+        delay = RetryDelay(
+            session["stop"] if session is not None else threading.Event(),
+            log,
+            "UDP receive",
+        )
+        while self.running.is_set() and (
+            session is None or not session["stop"].is_set()
+        ):
             with self._state_lock:
-                if self._session is not session:
+                if session is not None and self._session is not session:
                     return
                 self.chat_inbox.flush()
                 gap_delay = self.chat_inbox.gap_delay(time.monotonic())
-                
             try:
-                wait = UDP_TIMEOUT if gap_delay is None else min(UDP_TIMEOUT, gap_delay)
-                if not select.select([udp], [], [], wait)[0]:
-                    continue
+                if session is not None:
+                    wait = (
+                        UDP_TIMEOUT
+                        if gap_delay is None
+                        else min(UDP_TIMEOUT, gap_delay)
+                    )
+                    if not select.select([udp], [], [], wait)[0]:
+                        continue
                 raw, peer = udp.recvfrom(4096)
             except socket.timeout:
                 continue
-            except OSError as exc:
-                if retryable(exc, udp=True):
-                    time.sleep(0.1)
+            except (OSError, ValueError) as exc:
+                if isinstance(exc, OSError) and retryable(exc, udp=True):
+                    delay.wait(exc)
                     continue
-                self._request_disconnect(session, str(exc))
+                if session is not None:
+                    self._request_disconnect(session, str(exc))
                 break
-                
+            delay.reset()
             with self._state_lock:
-                if self._session is not session:
+                if session is not None and self._session is not session:
                     return
                 if peer != self.address or len(raw) > UDP_MTU:
                     continue
                 try:
+                    active = self._session
+                    if active is None:
+                        continue
                     record = unseal(raw, self.f)
                     msg = record[3]
                     validate_udp(msg, from_client=False)
-                except (ValueError, UnicodeError):
+                    if msg["type"] == "data":
+                        if msg["to"] != self.name:
+                            raise ValueError("Packet addressed to another client")
+                except ValueError as exc:
+                    if isinstance(exc, TransferCapacityError):
+                        self.events.put({"type": "error", "message": str(exc)})
                     continue
-                    
                 try:
-                    session["udp_security"].accept(record)
+                    active["udp_security"].accept(record)
                 except ValueError:
                     continue
-                    
                 typ = msg["type"]
                 if typ == "path_challenge":
                     try:
@@ -424,9 +722,9 @@ class Client:
                         event = self.pending.get(msg["id"])
                     if event:
                         event.set()
-                    record_chat = self.outgoing_chats.get(msg["id"])
-                    if record_chat:
-                        self._chat_accepted(msg["id"], record_chat)
+                    record = self.outgoing_chats.get(msg["id"])
+                    if record is not None:
+                        self._chat_accepted(msg["id"], record)
                 elif typ == "data":
                     mid = msg["id"]
                     if msg["kind"] == "chat":
@@ -437,43 +735,95 @@ class Client:
                         except OSError:
                             pass
                         continue
-                        
                     try:
                         accepted = self.on_data(msg)
-                        if accepted:
-                            self.send_raw({"type": "ack", "id": mid})
-                    except (ValueError, KeyError, OSError) as exc:
+                    except (ValueError, KeyError, TypeError, OSError) as exc:
                         self.events.put({"type": "error", "message": str(exc)})
+                        continue
+                    if accepted:
+                        try:
+                            self.send_raw({"type": "ack", "id": mid})
+                        except OSError:
+                            pass
 
-    def validate_transfer_packet(self, msg): return self._file_transfers.validate_transfer_packet(msg)
-    def on_data(self, msg): return self._file_transfers.on_data(msg)
-    def finish_file(self, key): return self._file_transfers.finish_file(key)
-    def finalize_worker(self, session): return self._file_transfers.finalize_worker(session)
-    def _finalize_file(self, session, key, f): return self._file_transfers._finalize_file(session, key, f)
-    
+    def validate_transfer_packet(self, msg):
+        return self._file_transfers.validate_transfer_packet(msg)
+
+    def on_data(self, msg):
+        return self._file_transfers.on_data(msg)
+
+    def finish_file(self, key):
+        return self._file_transfers.finish_file(key)
+
+    def finalize_worker(self, session):
+        return self._file_transfers.finalize_worker(session)
+
+    def _finalize_file(self, session, key, f):
+        return self._file_transfers._finalize_file(session, key, f)
+
     def _capture_session(self):
         with self._state_lock:
-            if self.status != "connected" or self._session is None:
-                raise ConnectionError("Client session ended")
-            return self._session
+            session = self._session
+            expected = getattr(self._operation_context, "session", session)
+            if self.status != "connected" or session is None or session is not expected:
+                raise ConnectionError("Client session ended or changed")
+            return session
 
-    def send_packets(self, packets, window=SEND_WINDOW, retries=CLIENT_RETRIES, timeout=RETRY_TIMEOUT, *, session=None, file_record=None, deadline=None):
+    def _run_in_session(self, session, fn, *args):
+        self._operation_context.session = session
+        try:
+            self._capture_session()
+            return fn(*args)
+        finally:
+            del self._operation_context.session
+
+    def send_packets(
+        self,
+        packets,
+        window=SEND_WINDOW,
+        retries=CLIENT_RETRIES,
+        timeout=RETRY_TIMEOUT,
+        *,
+        session=None,
+        file_record=None,
+        deadline=None,
+    ):
+        """Send packets through a sliding window and retry missing hop ACKs.
+
+        ACK waiter entries created by the call are removed on exit. Completion confirms
+        hop acceptance, not final chat delivery or successful file verification.
+
+        Args:
+            packets: Indexed sequence of client UDP packets with application IDs.
+            window: Maximum number of packets awaiting ACKs at once.
+            retries: Maximum send attempts per unacknowledged packet.
+            timeout: Minimum interval between attempts for a packet, in seconds.
+            session: Expected active session, or None to capture the current one.
+            file_record: Optional outgoing file record checked for cancellation/results.
+            deadline: Absolute monotonic file-transfer deadline in seconds. It is checked
+                through file_record; it is not a general chat send deadline.
+
+        Raises:
+            ConnectionError: The expected session ends or is replaced.
+            TimeoutError: ACK attempts or the file-transfer deadline are exhausted.
+            OSError: A non-retryable UDP error occurs.
+        """
         session = self._capture_session() if session is None else session
         with self._state_lock:
-            congestion = session.setdefault("congestion", CubicController())
-            
+            congestion = session.get("congestion")
+            if congestion is None:
+                congestion = session["congestion"] = CubicController()
         inflight = {}
         i = 0
+        delay = RetryDelay(session["stop"], log, "UDP send", log_errors=False)
         try:
             while i < len(packets) or inflight:
                 if file_record is not None:
                     self._file_transfers.check_sending(file_record, deadline)
                     if file_record["result"] is not None:
                         return
-                        
                 if session is not self._session or self.status != "connected":
-                    raise ConnectionError("Session ended")
-                    
+                    raise ConnectionError("Session ended while sending")
                 while i < len(packets) and len(inflight) < window:
                     p = packets[i]
                     ev = threading.Event()
@@ -481,7 +831,6 @@ class Client:
                         self.pending[p["id"]] = ev
                     inflight[p["id"]] = (p, ev, 0, 0)
                     i += 1
-                    
                 for mid, (p, ev, tries, last) in list(inflight.items()):
                     if ev.is_set():
                         congestion.acknowledge(mid)
@@ -489,23 +838,28 @@ class Client:
                         with self.pending_lock:
                             self.pending.pop(mid, None)
                         continue
-                        
-                    if tries and not congestion.retry_due(mid, time.monotonic(), timeout):
+                    if tries and not congestion.retry_due(
+                        mid, time.monotonic(), timeout
+                    ):
                         continue
                     if tries >= retries:
-                        raise TimeoutError(f"No ACK for packet {mid}")
+                        raise TimeoutError("No ACK for packet " + mid)
                     if not congestion.try_send(mid, minimum_retry=timeout):
                         continue
-                        
                     try:
                         with self._state_lock:
-                            if self._session is not session or self.status != "connected":
-                                raise ConnectionError("Session ended")
+                            if (
+                                self._session is not session
+                                or self.status != "connected"
+                            ):
+                                raise ConnectionError("Session ended while sending")
                             self.send_raw(p)
+                        delay.reset()
                     except OSError as exc:
                         if not retryable(exc, udp=True):
                             self._request_disconnect(session, str(exc))
                             raise
+                        delay.wait(exc)
                     inflight[mid] = (p, ev, tries + 1, time.monotonic())
                 time.sleep(SEND_POLL_INTERVAL)
         finally:
@@ -514,19 +868,73 @@ class Client:
                     self.pending.pop(mid, None)
                     congestion.discard(mid)
 
-    def packet(self, to: str, kind: str, payload: str = "", meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    def packet(
+        self, to: str, kind: str, payload: str = "", meta: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Build an outbound data packet without attaching session credentials.
+
+        Args:
+            to: Recipient username, or * for broadcast.
+            kind: Application data kind.
+            payload: Chat text or an encoded file chunk; empty for file control packets.
+            meta: Metadata mapping retained by reference, or None for a fresh empty mapping.
+
+        Returns:
+            A new packet dictionary with a random application ID.
+        """
         return data_packet(to, kind, payload, meta)
 
-    def _chat_accepted(self, mid, record): return self._chat_sender._chat_accepted(mid, record)
-    def _receive_chat_status(self, msg, session): return self._chat_sender._receive_chat_status(msg, session)
-    def _preflight_chat(self, packet): return self._chat_sender._preflight_chat(packet)
-    def chat(self, recipient: str, text: str) -> None: return self._chat_sender.chat(recipient, text)
-    def file(self, recipient: str, path: str | Path) -> None: return self._file_transfers.file(recipient, path)
+    def _chat_accepted(self, mid, record):
+        return self._chat_sender._chat_accepted(mid, record)
+
+    def _receive_chat_status(self, msg, session):
+        return self._chat_sender._receive_chat_status(msg, session)
+
+    def _preflight_chat(self, packet):
+        return self._chat_sender._preflight_chat(packet)
+
+    def chat(self, recipient: str, text: str) -> None:
+        """Send chat and wait for the server's final recipient result.
+
+        Args:
+            recipient: Account username, or * for broadcast.
+            text: Chat content satisfying character and encrypted-datagram limits.
+
+        Raises:
+            ValueError: Packet validation or datagram-size checks fail.
+            ConnectionError: The session ends or changes while sending.
+            TimeoutError: Delivery remains unconfirmed before the confirmation deadline.
+            RuntimeError: Admission capacity is exhausted or final delivery fails.
+        """
+        return self._chat_sender.chat(recipient, text)
+
+    def file(self, recipient: str, path: str | Path) -> None:
+        """Send a file and wait for recipient verification and save receipts.
+
+        The source is hashed and streamed in chunks. Progress/results are placed on the
+        client event queue; temporary outgoing state is released when the call finishes.
+
+        Args:
+            recipient: Account username, or * for broadcast.
+            path: Source path, relative to the process working directory unless absolute.
+
+        Raises:
+            FileNotFoundError: The source path does not name a regular file.
+            ValueError: The file exceeds 25 MiB or packet validation fails.
+            ConnectionError: The captured client session ends or changes.
+            TimeoutError: The transfer or acknowledgement deadline is exhausted.
+            RuntimeError: Outgoing capacity is exhausted, the source changes, or delivery fails.
+            OSError: Reading the source or sending packets fails.
+        """
+        return self._file_transfers.file(recipient, path)
 
 
 def main() -> int:
+    """Preserve the legacy entry point without importing the CLI during core import."""
     from collab.client.cli import main as cli_main
+
     return cli_main()
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -4,7 +4,9 @@ import argparse
 import logging
 import sys
 
-from collab.client.terminal_auth import add_connection_arguments, authenticate
+from collab.client.terminal_auth import add_connection_arguments
+from collab.client import Client
+from .auth import BrowserAuth
 from .handlers import handler_factory
 from .runtime import BoundedHTTPServer
 
@@ -12,15 +14,7 @@ log = logging.getLogger(__name__)
 
 
 def main() -> int:
-    """Authenticate in the terminal and serve the local browser interface.
-
-    The HTTP listener opens only after login. Shutdown closes the HTTP runtime and
-    its client, or closes the client directly if HTTP startup did not finish.
-
-    Returns:
-        Zero for a normal exit, EOF, or interrupt; one for a reported backend or
-        cleanup failure.
-    """
+    """Open a loopback browser login page; CLI authentication stays terminal-only."""
     parser = argparse.ArgumentParser()
     add_connection_arguments(parser)
     parser.add_argument("--web-port", type=int, default=8080)
@@ -28,12 +22,12 @@ def main() -> int:
     client = http = None
     result = 0
     try:
-        client = authenticate(args)
-        if client is None:
-            return 0
-        http = BoundedHTTPServer(("127.0.0.1", args.web_port), handler_factory(client))
+        client = Client(args.name or "", args.host, args.port, args.downloads,
+                        cafile=args.ca, server_name=args.server_name)
+        auth = BrowserAuth(client, args.name)
+        http = BoundedHTTPServer(("127.0.0.1", args.web_port), handler_factory(client, auth=auth))
         print(
-            f"Open http://127.0.0.1:{args.web_port} for user {client.name}", flush=True
+            f"Open http://127.0.0.1:{http.server_port}/login to sign in", flush=True
         )
         http.serve_forever()
     except (KeyboardInterrupt, EOFError):

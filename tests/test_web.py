@@ -140,6 +140,7 @@ class WebUIIntegrationTests(unittest.TestCase):
         progress = [e for e in incoming if e["type"] == "file_progress"]
         complete = next(e for e in incoming if e["type"] == "file_complete")
         self.assertTrue(progress)
+        self.assertTrue(all(e["channel"] == "bob" for e in [start, *progress, complete]))
         self.assertTrue(
             all(
                 (e["transfer"], e["sender_session"])
@@ -160,6 +161,21 @@ class WebUIIntegrationTests(unittest.TestCase):
                 for e in outgoing
             )
         )
+
+    def test_broadcast_file_events_keep_everyone_channel(self):
+        source = self.root / "broadcast.bin"
+        source.write_bytes(b"broadcast-file" * 50)
+        self.a.file("*", source)
+        incoming = self.events()["events"]
+        file_events = [e for e in incoming if e["type"] in
+                       {"file_receiving", "file_progress", "file_complete"}]
+        self.assertTrue(file_events)
+        self.assertTrue(all(e["channel"] == "*" for e in file_events))
+        self.assertTrue(any(e["type"] == "file_complete" for e in file_events))
+        sent = [e for e in list(self.a.events.queue) if e["type"] in
+                {"file_sending", "file_send_progress", "file_sent"}]
+        self.assertTrue(sent)
+        self.assertTrue(all(e["channel"] == "*" for e in sent))
 
     def test_empty_file_still_has_start_and_completion_events(self):
         source = self.root / "empty.bin"
@@ -185,19 +201,22 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 class Element {
     constructor() { this.textContent=''; this.value=''; this.children=[]; this.options=[]; this.disabled=false; }
+    set textContent(value) { this._text=value; this.children=[]; }
+    get textContent() { return (this._text || '') + this.children.map(x=>x.textContent || '').join(''); }
     setAttribute() {}
     addEventListener(name, callback) { (this.listeners ||= {})[name] = callback; }
     append(...items) { this.children.push(...items); }
-    replaceChildren(...items) { this.options=items; this.value=items[0]?.value || ''; }
+    replaceChildren(...items) { this.options=items; this.children=items; this._text=''; this.value=items[0]?.value || ''; }
     add(item) { this.options.push(item); }
 }
 const elements = {};
-for (const id of ['self','connection','online','messages','to','message','send-chat','send-file','file','transfers','status']) elements[id]=new Element();
+for (const id of ['self','connection','online','messages','to','message','send-chat','send-file','file','transfers','status','avatar','online-count','conversation-count','chat-title','chat-subtitle','chat-form','logout']) elements[id]=new Element();
 elements.to.value='*';
 const snapshots = [];
 const sandbox = {
     document:{getElementById:id=>elements[id], createElement:()=>new Element()},
     Option:function(text,value){this.text=text;this.value=value;},
+    window:{matchMedia:()=>({matches:false})},
     setTimeout:()=>{},
     fetch:async()=>({ok:true,json:async()=>snapshots.shift()})
 };
@@ -210,25 +229,37 @@ vm.runInContext(SCRIPT, sandbox);
     assert.equal(elements['send-chat'].disabled,false);
     assert.deepEqual(elements.to.options.map(x=>x.value),['*','alice']);
     const run = code=>vm.runInContext(code,sandbox);
+    elements.to.value='alice';
     run(`receiveEvent({type:'chat',from:'alice',text:'<img src=x onerror=alert(1)>'})`);
     assert.ok(elements.messages.textContent.includes('<img src=x onerror=alert(1)>'));
-    assert.equal(elements.messages.children.length,0);
-    run(`receiveEvent({type:'file_progress',transfer:'one',sender_session:'s',from:'alice',filename:'same.bin',received:1,total:4})`);
-    run(`receiveEvent({type:'file_progress',transfer:'two',sender_session:'s',from:'alice',filename:'same.bin',received:3,total:4})`);
-    assert.equal(elements.transfers.children.length,2);
-    assert.equal(elements.transfers.children[0].children[1].value,25);
-    assert.equal(elements.transfers.children[1].children[1].value,75);
-    run(`receiveEvent({type:'file_complete',transfer:'one',sender_session:'s',from:'alice',filename:'same.bin',path:'downloads/file.bin'})`);
-    assert.equal(elements.transfers.children[0].children[1].value,100);
-    assert.equal(elements.transfers.children[0].children[2].textContent,'Received and saved');
-    assert.equal(elements.transfers.children[1].children[1].value,75);
-    run(`receiveEvent({type:'file_receiving',transfer:'empty',sender_session:'s',from:'alice',filename:'empty.bin',total:0})`);
-    run(`receiveEvent({type:'file_complete',transfer:'empty',sender_session:'s',from:'alice',filename:'empty.bin',path:'downloads/empty.bin'})`);
-    assert.equal(elements.transfers.children[2].children[1].value,100);
+    assert.equal(elements.messages.children.length,1);
+    assert.equal(elements.messages.children[0].children.at(-1).textContent,'<img src=x onerror=alert(1)>');
+    const cards=()=>elements.messages.children.filter(row=>row.className.includes('file-message'));
+    run(`receiveEvent({type:'file_progress',transfer:'one',sender_session:'s',from:'alice',channel:'bob',filename:'same.bin',received:1,total:4})`);
+    run(`receiveEvent({type:'file_progress',transfer:'two',sender_session:'s',from:'alice',channel:'bob',filename:'same.bin',received:3,total:4})`);
+    assert.equal(cards().length,2);
+    assert.equal(cards()[0].children[2].value,25);
+    assert.equal(cards()[1].children[2].value,75);
+    elements.to.value='*';run('renderMessages()');
+    assert.equal(cards().length,0);
+    run(`receiveEvent({type:'file_complete',transfer:'one',sender_session:'s',from:'alice',channel:'bob',filename:'same.bin',path:'downloads/file.bin'})`);
+    assert.equal(cards().length,0); // Completion must not follow the currently selected channel.
+    run(`receiveEvent({type:'file_receiving',transfer:'global',sender_session:'s',from:'alice',channel:'*',filename:'global.bin',total:1})`);
+    assert.equal(cards().length,1);
+    assert.equal(cards()[0].children[1].textContent,'global.bin');
+    elements.to.value='alice';run('renderMessages()');
+    assert.equal(cards().length,2);
+    assert.equal(cards()[0].children[2].value,100);
+    assert.equal(cards()[0].children[3].textContent,'Received and saved · SHA-256 verified');
+    assert.equal(cards()[1].children[2].value,75);
+    assert.ok(!elements.messages.textContent.includes('global.bin'));
+    run(`receiveEvent({type:'file_receiving',transfer:'empty',sender_session:'s',from:'alice',channel:'bob',filename:'empty.bin',total:0})`);
+    run(`receiveEvent({type:'file_complete',transfer:'empty',sender_session:'s',from:'alice',channel:'bob',filename:'empty.bin',path:'downloads/empty.bin'})`);
+    assert.equal(cards()[2].children[2].value,100);
     run(`receiveEvent({type:'file_send_progress',transfer:'send',to:'alice',filename:'out.bin',sent:4,total:4})`);
-    assert.ok(elements.transfers.children[3].children[2].textContent.includes('Waiting for recipient confirmation'));
+    assert.ok(cards()[3].children[3].textContent.includes('Waiting for recipient confirmation'));
     run(`receiveEvent({type:'file_sent',transfer:'send',to:'alice',filename:'out.bin'})`);
-    assert.equal(elements.transfers.children[3].children[2].textContent,'Delivered to recipient(s)');
+    assert.equal(cards()[3].children[3].textContent,'Delivered to recipient(s)');
     assert.ok(!elements.messages.textContent.includes('File sent to server'));
     snapshots.push({self:'bob',names:['bob'],status:'connected',events:[]});
     elements.to.value='alice';
@@ -268,6 +299,21 @@ vm.runInContext(SCRIPT, sandbox);
     sandbox.fetch = async()=>({ok:true,json:async()=>({accepted:true})});
     await run('sendChat()');
     assert.equal(elements.message.value,'');
+    // Reading a file is asynchronous: changing the selected channel must not retarget it.
+    let releaseRead, fileRequest;
+    const reading = new Promise(resolve=>{releaseRead=resolve;});
+    elements.file.files=[{name:'pinned.bin',size:3,arrayBuffer:()=>reading}];
+    sandbox.btoa=text=>Buffer.from(text,'binary').toString('base64');
+    sandbox.fetch=async(path,options)=>{
+        assert.equal(path,'/file');fileRequest=JSON.parse(options.body);
+        return {ok:true,json:async()=>({accepted:true})};
+    };
+    elements.to.value='alice';
+    const uploading=run('sendFile()');
+    elements.to.value='*';
+    releaseRead(Uint8Array.from([1,2,3]).buffer);
+    await uploading;
+    assert.deepEqual(fileRequest,{to:'alice',filename:'pinned.bin',data:'AQID'});
     sandbox.fetch = async()=>({ok:true,json:async()=>snapshots.shift()});
     snapshots.push({self:'bob',names:[],status:'disconnected',events:[]});
     await run('poll()');
@@ -436,7 +482,7 @@ class HTTPConcurrencyTests(unittest.TestCase):
         wait_for(self, lambda: self.handler.runtime.tasks.admitted == 0)
         texts = [call.args[1] for call in self.client.chat.call_args_list]
         self.assertNotIn("old session", texts)
-        self.assertTrue(
+        self.assertFalse(
             any(
                 "session" in e.get("message", "")
                 for e in list(self.client.events.queue)

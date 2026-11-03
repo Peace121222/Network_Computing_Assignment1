@@ -46,7 +46,9 @@ class WebRuntime:
             try:
                 self.client._run_in_session(session, fn, *args)
             except Exception as exc:
-                self.client.events.put({"type": "error", "message": str(exc)})
+                with self.client._state_lock:
+                    if self.client._session is session:
+                        self.client.events.put({"type": "error", "message": str(exc)})
 
         self.tasks.submit(lease, run, cleanup)
 
@@ -173,6 +175,10 @@ class BoundedHTTPServer(HTTPServer):
         cleanup = Cleanup()
         try:
             self._closing = True
+            auth = getattr(self.runtime, "auth", None)
+            if auth is not None:
+                auth.closing.set()
+                auth.token = None
             cleanup.attempt("HTTP serving", self._stop_serving, deadline)
             cleanup.attempt("HTTP listener", super().server_close)
             if self._requests_lock.acquire(timeout=max(0, deadline - time.monotonic())):

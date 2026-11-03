@@ -122,6 +122,7 @@ class TCPReader:
         self.body = bytearray()
         self.size = None
         self.failed = False
+        self.last_frame_bytes = 0
         self.max_frame = MAX_FRAME
         self.wait_timeout = SESSION_TIMEOUT
         self.stop_event = None
@@ -222,6 +223,7 @@ class TCPReader:
         except (OSError, ValueError):
             self.failed = True
             raise
+        self.last_frame_bytes = 4 + self.size
         self.header.clear()
         self.body.clear()
         self.size = None

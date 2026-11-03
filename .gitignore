@@ -30,6 +30,7 @@ dist/
 *.egg-info/
 
 # Local logs
+/logs/
 *.log
 
 # Editor and operating-system files

@@ -72,6 +72,12 @@ class RelayRouter:
                 "delivered": delivered,
                 "failures": failures,
             }
+        if not record.get("event_logged"):
+            server.log_event("chat.result", user=record["source"], id=record["id"],
+                             state=record["result"]["state"],
+                             recipient=",".join(record["result"]["recipients"]),
+                             level="INFO" if record["result"]["state"] == "delivered" else "WARNING")
+            record["event_logged"] = True
         source = server.users.get(record["source"])
         if source is None or source["token"] != record["source_token"]:
             return
@@ -318,6 +324,9 @@ class RelayRouter:
                 ):
                     continue
                 if item["attempts"] >= SERVER_RETRIES:
+                    server.log_event("udp.retry_exhausted", "WARNING", protocol="UDP",
+                                     id=key[1], recipient=key[0], attempt=item["attempts"],
+                                     reason="delivery_timeout")
                     del server.pending[key]
                     self._chat_outcome_locked(item, key[0], "delivery_timeout")
                     server.file_transfers.pending_outcome(
@@ -365,7 +374,16 @@ class RelayRouter:
                 plans.append((key, item, source, destination))
         for key, item, source, destination in plans:
             raw = item["packet"]
-            server._send_session_udp(
+            sent = server._send_session_udp(
                 raw,
                 [(item["packet"]["from"], source), (item["packet"]["to"], destination)],
             )
+            if sent and item["attempts"] > 1:
+                server.log_event("delivery.retry", "WARNING", recipient=key[0],
+                                 id=key[1], message=raw["kind"], attempt=item["attempts"])
+            if sent and server.trace_network:
+                metrics = destination["congestion"].snapshot()
+                server.log_event("udp.retry" if item["attempts"] > 1 else "udp.window_send",
+                                 protocol="UDP", direction="TX", id=key[1], recipient=key[0],
+                                 message=raw["kind"], attempt=item["attempts"],
+                                 **{k: metrics[k] for k in ("cwnd", "inflight", "rto", "rtt", "loss_events")})

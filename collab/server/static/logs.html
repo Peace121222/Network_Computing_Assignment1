@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Collab LAN · Server log</title>
+<link rel="stylesheet" href="/logs.css">
+<script src="/logs.js" defer></script>
+</head>
+<body>
+<main>
+  <div class="heading">
+    <div><p class="product">Collab LAN</p><h1>Server log</h1><p>Connections, secure messages and file transfers.</p></div>
+    <div class="live-controls"><span id="connection" role="status">Connecting…</span><button id="pause">Pause updates</button></div>
+  </div>
+  <div class="toolbar">
+    <label class="search-label">Search<input id="search" type="search" placeholder="Search user or activity…"></label>
+    <label>Level<select id="level"><option value="">All levels</option><option value="INFO">Info</option><option value="WARNING">Warning</option><option value="ERROR">Error</option></select></label>
+    <span id="count">0 events</span>
+  </div>
+  <p id="health" class="health" role="alert" hidden></p>
+  <div class="table">
+    <table><thead><tr><th>Time · local</th><th>Level</th><th>Activity</th></tr></thead><tbody id="rows"></tbody></table>
+    <p id="empty">Waiting for server activity.</p>
+  </div>
+  <footer id="retention">Latest 1,000 activity events · newest first · updates every second.</footer>
+</main>
+</body>
+</html>

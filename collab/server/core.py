@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import errno
 import logging
+import json
 import math
 import select
 import socket
@@ -43,9 +44,11 @@ from collab.shared.protocol import validate_tcp, validate_udp
 from collab.shared.resilience import Cleanup, RetryDelay, SendBackoff, retryable
 from collab.transport.congestion import CubicController
 from collab.transport.handshake import server_login
-from collab.transport.security import Channel, nonce, unseal
+from collab.transport.security import Channel, nonce, unseal, encrypted_size
 from collab.transport.tcp import TCPReader, frame_tcp, send_tcp
 from collab.transport.tls import server_context
+from collab.server.monitor import EventJournal, LogConsole
+from collab.server.trace import endpoint, packet_metadata, ciphertext_metadata, redacted_packet
 from collab.transport.udp import encode_udp, udp_frame_size
 
 log = logging.getLogger(__name__)
@@ -88,6 +91,7 @@ class Server:
         max_pending_per_recipient: int = 1024,
         file_idle_timeout: float = FILE_IDLE_TIMEOUT,
         file_transfer_timeout: float = FILE_TRANSFER_TIMEOUT,
+        trace_network: bool = False,
     ) -> None:
         for value in (
             session_expiry,
@@ -123,6 +127,8 @@ class Server:
             file_idle_timeout,
             file_transfer_timeout,
         )
+        self.trace_network = trace_network
+        self.events = EventJournal()
         self.database = database
         self.accounts = None
         self.auth_limiter = AuthLimiter(limit=auth_limit, window=auth_window)
@@ -154,6 +160,64 @@ class Server:
         self.file_transfers = ServerFileTransfers(self)
         self.revision = 0
         self.tcp = self.udp = None
+
+    def log_event(self, event, level="INFO", **fields):
+        """Record metadata only; never pass protocol payloads or credentials here."""
+        entry = self.events.emit(event, level, **fields)
+        # Packet traces stay in the bounded journal/file instead of flooding stderr.
+        if not event.startswith(("udp.", "tcp.sent", "tcp.received")):
+            details = entry["details"]
+            if event == "security.encrypted":
+                details = {k: details[k] for k in ("user", "recipient", "message") if k in details}
+            log.log(getattr(logging, level), "%s %s", event, details)
+
+    def _auth_reply(self, sock, message, deadline=None, *, security=None):
+        send_tcp(sock, message, deadline, security=security)
+        if message.get("type") == "welcome":
+            self.log_event("connection.welcome_sent", protocol="TCP",
+                           destination=endpoint(sock.getpeername()), message="welcome", encrypted=True)
+        if self.trace_network:
+            size = len(json.dumps(message, separators=(",", ":")).encode())
+            self.trace_packet("TCP", "TX", message, sock.getsockname(), sock.getpeername(),
+                              app_frame_bytes=4 + (encrypted_size(size) if security else size),
+                              encrypted=True)
+
+    def _demo_encrypted_packet(self, message, raw, destination, source_address, address):
+        """One real ciphertext example per chat/start/end/first chunk, not per retry.
+
+        Called under the destination UDP gate after sendto succeeds. A bounded cache
+        avoids duplicating the example when an application packet is retransmitted.
+        """
+        kind = message.get("kind")
+        if kind not in {"chat", "file_start", "file_end"} and not (
+            kind == "file_chunk" and message.get("meta", {}).get("index") == 0
+        ):
+            return
+        seen = destination.setdefault("demo_packets", OrderedDict())
+        packet_id = message["id"]
+        if packet_id in seen:
+            return
+        seen[packet_id] = None
+        if len(seen) > 256:
+            seen.popitem(last=False)
+        self.log_event(
+            "security.encrypted", **packet_metadata(message),
+            protocol="UDP", direction="TX", source=endpoint(source_address),
+            destination=endpoint(address), encrypted=True, bytes=len(raw),
+            packet_example=redacted_packet(message), **ciphertext_metadata(raw),
+        )
+
+    def trace_packet(self, protocol, direction, message, source, destination, **fields):
+        """Record a completed application send/receive, not a wire capture."""
+        if not self.trace_network:
+            return
+        metadata = packet_metadata(message)
+        metadata.update(fields)
+        self.log_event(
+            protocol.lower() + (".sent" if direction == "TX" else ".received"),
+            protocol=protocol, direction=direction, source=endpoint(source),
+            destination=endpoint(destination), **metadata,
+        )
 
     @property
     def last_error(self) -> dict[str, Any] | None:
@@ -205,6 +269,7 @@ class Server:
                     raise RuntimeError("Worker returned unexpectedly")
             except BaseException as exc:
                 if not self.stopping.is_set():
+                    self.log_event("worker.failed", "ERROR", reason=type(exc).__name__)
                     self._request_stop(
                         getattr(target, "__name__", "unknown"), exc, run_id
                     )
@@ -304,6 +369,10 @@ class Server:
                         self._start_thread(task, critical=True)
                     )
                 self.status = "running"
+                self.log_event("server.started", peer=f"{self.host}:{self.tcp_port}")
+                if self.trace_network:
+                    self.log_event("tcp.listening", protocol="TCP", source=endpoint(self.tcp.getsockname()))
+                    self.log_event("udp.listening", protocol="UDP", source=endpoint(self.udp.getsockname()))
             except BaseException as exc:
                 self._last_error = {
                     "worker": "startup",
@@ -473,6 +542,10 @@ class Server:
                 ):
                     return False
                 del self.users[name]
+                self.log_event("session.closed", user=name,
+                               reason="expired" if expired_at is not None else "disconnected",
+                               protocol="TCP", source=endpoint(user["tcp_addr"]) if "tcp_addr" in user else None,
+                               online=len(self.users))
                 self.file_transfers.remove_session(token, time.monotonic())
                 if user["ready"]:
                     self.revision += 1
@@ -543,6 +616,7 @@ class Server:
 
     def _write_control(self, sock, msg, security=None):
         frame = memoryview(frame_tcp(msg, security))
+        frame_bytes = len(frame)
         deadline = time.monotonic() + CONTROL_TIMEOUT
         while frame:
             remaining = deadline - time.monotonic()
@@ -562,6 +636,10 @@ class Server:
             if count == 0:
                 raise ConnectionError("Control socket closed")
             frame = frame[count:]
+        if self.trace_network:
+            self.trace_packet("TCP", "TX", msg, sock.getsockname(), sock.getpeername(),
+                              app_frame_bytes=frame_bytes, encrypted=True,
+                              sequence=security.sent if security else None)
 
     def control_writer(self, name, user):
         """Drain one session's bounded control mailboxes and write TCP frames.
@@ -696,6 +774,8 @@ class Server:
                     continue
                 raise
             delay.reset()
+            self.log_event("tcp.accepted", protocol="TCP", direction="RX",
+                           source=endpoint(conn.getpeername()), destination=endpoint(conn.getsockname()))
             with self.lock:
                 accepted = (
                     self.running.is_set()
@@ -747,13 +827,16 @@ class Server:
             try:
                 self.accounts.register(request["name"], request.pop("password"))
                 response = dict(type="registered")
+                self.log_event("account.registered", user=request["name"])
             except ValueError as exc:
                 response = dict(type="error", message=str(exc))
-            send_tcp(conn, response, deadline)
+                self.log_event("account.rejected", "WARNING", user=request["name"])
+            self._auth_reply(conn, response, deadline)
             return False
         authenticated = self.accounts.verify(request["name"], request.pop("password"))
         if not authenticated:
-            send_tcp(
+            self.log_event("login.failed", "WARNING", user=request["name"])
+            self._auth_reply(
                 conn,
                 dict(type="error", message="Invalid username or password"),
                 deadline,
@@ -784,8 +867,12 @@ class Server:
                 self.connections.discard(original)
                 self.connections.add(conn)
             self._complete_tls_handshake(conn, deadline)
+            self.log_event("tls.established", protocol="TCP", source=endpoint(conn.getpeername()),
+                           destination=endpoint(conn.getsockname()), encrypted=True,
+                           tls_version=conn.version(), cipher=conn.cipher()[0])
             if not self.auth_limiter.allow(conn.getpeername()[0]):
-                send_tcp(
+                self.log_event("auth.rate_limited", "WARNING", peer=conn.getpeername()[0])
+                self._auth_reply(
                     conn,
                     dict(
                         type="error",
@@ -795,6 +882,8 @@ class Server:
                 )
                 return
             request, reader = server_login(conn, deadline, self.stopping)
+            self.trace_packet("TCP", "RX", request, conn.getpeername(), conn.getsockname(),
+                              app_frame_bytes=reader.last_frame_bytes, encrypted=True)
             if not self.accounts.slots.acquire(
                 timeout=max(0, deadline - time.monotonic())
             ):
@@ -812,7 +901,7 @@ class Server:
                 if request["type"] != "login":
                     raise ValueError("Expected login")
             except ValueError:
-                send_tcp(
+                self._auth_reply(
                     conn,
                     dict(type="error", message="Invalid login"),
                     deadline=deadline,
@@ -846,7 +935,8 @@ class Server:
                     )
                     self.users[name] = user
             if duplicate:
-                send_tcp(
+                self.log_event("login.duplicate", "WARNING", user=name)
+                self._auth_reply(
                     conn,
                     dict(type="error", message="User already connected"),
                     deadline=deadline,
@@ -855,7 +945,7 @@ class Server:
                 return
             if token is None:
                 return
-            send_tcp(
+            self._auth_reply(
                 conn,
                 dict(
                     type="welcome",
@@ -883,8 +973,12 @@ class Server:
                 user["ready"] = True
                 self.revision += 1
             self.presence_dirty.set()
+            self.log_event("login.succeeded", user=name, online=len(self.users),
+                           protocol="TCP", source=endpoint(conn.getpeername()),
+                           destination=endpoint(conn.getsockname()))
             self._serve_session(name, user, reader)
         except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error) as exc:
+            self.log_event("connection.ended", "WARNING", user=name, reason=type(exc).__name__)
             log.debug("TCP exit: %s", exc)
         finally:
             if token is not None:
@@ -903,6 +997,10 @@ class Server:
             except socket.timeout:
                 continue
             validate_tcp(msg, from_client=True)
+            if self.trace_network:
+                self.trace_packet("TCP", "RX", msg, user["sock"].getpeername(),
+                                  user["sock"].getsockname(), app_frame_bytes=reader.last_frame_bytes,
+                                  encrypted=True, sequence=reader.security.highest)
             if msg["type"] not in {"logout", "users", "file_receipt", "file_abort"}:
                 raise ValueError("Unexpected TCP message after login")
             if msg["type"] == "logout":
@@ -965,6 +1063,11 @@ class Server:
             )
             try:
                 udp.sendto(raw, address)
+                self._demo_encrypted_packet(message, raw, destination, (self.host, self.udp_port), address)
+                if self.trace_network:
+                    self.trace_packet("UDP", "TX", message, udp.getsockname(), address,
+                                      bytes=len(raw), sequence=destination["udp_security"].sent,
+                                      encrypted=True, **ciphertext_metadata(raw))
             except OSError as exc:
                 if self.stopping.is_set():
                     return False
@@ -1005,6 +1108,9 @@ class Server:
             addr: Source IP/port tuple supplied by recvfrom().
         """
         if len(raw) > UDP_MTU:
+            if self.trace_network:
+                self.log_event("udp.dropped", "WARNING", protocol="UDP", direction="RX",
+                               source=endpoint(addr), bytes=len(raw), reason="oversize")
             return
         try:
             context = raw[:32].decode("ascii")
@@ -1015,11 +1121,17 @@ class Server:
                     if u["public_id"] == context and u["ready"] and "udp_security" in u
                 ]
             if not candidates:
+                if self.trace_network:
+                    self.log_event("udp.dropped", "WARNING", protocol="UDP", direction="RX",
+                                   source=endpoint(addr), bytes=len(raw), reason="unknown_session")
                 return
             record = unseal(raw, candidates[0])
             msg = record[3]
             validate_udp(msg, from_client=True)
         except (ValueError, UnicodeError):
+            if self.trace_network:
+                self.log_event("udp.dropped", "WARNING", protocol="UDP", direction="RX",
+                               source=endpoint(addr), bytes=len(raw), reason="invalid_datagram")
             return
         name, token = msg["from"], msg["token"]
         challenge = None
@@ -1037,7 +1149,14 @@ class Server:
             try:
                 security.accept(record)
             except ValueError:
+                if self.trace_network:
+                    self.log_event("udp.dropped", "WARNING", protocol="UDP", direction="RX",
+                                   source=endpoint(addr), reason="replay_or_invalid_envelope", bytes=len(raw))
                 return
+            if self.trace_network:
+                self.trace_packet("UDP", "RX", msg, addr, self.udp.getsockname(),
+                                  bytes=len(raw), sequence=record[2], encrypted=True,
+                                  verified=user["udp_addr"] == addr, **ciphertext_metadata(raw))
             now = time.monotonic()
             expired = now - user["last_seen"] >= self.session_expiry
             if not expired:
@@ -1052,6 +1171,8 @@ class Server:
                         changed = user["udp_addr"] != addr
                         user["udp_addr"] = addr
                         user.pop("udp_candidate", None)
+                        self.log_event("session.udp_verified", user=name, protocol="UDP",
+                                       source=endpoint(addr), verified=True)
 
                 elif user["udp_addr"] != addr:
                     if (
@@ -1078,6 +1199,12 @@ class Server:
                                 user["congestion"].acknowledge(msg["id"], now)
                             self._chat_outcome_locked(item, name, "delivered")
                             self.file_transfers.acknowledged(item, now)
+                            if self.trace_network:
+                                metrics = user["congestion"].snapshot() if "congestion" in user else {}
+                                self.log_event("udp.ack_matched", protocol="UDP", direction="RX",
+                                               user=name, id=msg["id"],
+                                               source=endpoint(addr), destination=endpoint(self.udp.getsockname()),
+                                               **{k: metrics[k] for k in ("cwnd", "inflight", "rto", "rtt", "loss_events") if k in metrics})
         if expired:
             self.remove_session(name, token, expired_at=now)
             return
@@ -1139,9 +1266,14 @@ def main() -> int:
     parser.add_argument("--database", default="accounts.sqlite3")
     parser.add_argument("--auth-limit", type=int, default=10)
     parser.add_argument("--auth-window", type=float, default=60)
+    parser.add_argument("--log-file", default="logs/server.jsonl")
+    parser.add_argument("--log-web-port", type=int, default=None,
+                        help="Enable local read-only server log UI, e.g. 8090")
+    parser.add_argument("--trace-network", action="store_true",
+                        help="Record rubric-focused TCP/UDP application frame evidence")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    server = None
+    server = console = None
     result = 0
     try:
         server = Server(
@@ -1153,7 +1285,12 @@ def main() -> int:
             auth_window=args.auth_window,
             certfile=args.cert,
             keyfile=args.key,
+            trace_network=args.trace_network,
         )
+        server.events.start_file(args.log_file)
+        if args.log_web_port is not None:
+            console = LogConsole(server.events, args.log_web_port)
+            print("Server log: " + console.url, flush=True)
         server.start()
         server.stopping.wait()
         if server.last_error is not None:
@@ -1174,6 +1311,20 @@ def main() -> int:
             except Exception as exc:
                 log.exception("Server cleanup failed")
                 print("ERROR: " + str(exc), file=sys.stderr)
+                result = 1
+        if console is not None:
+            try:
+                console.close()
+            except Exception:
+                log.exception("Log console cleanup failed")
+                result = 1
+        if server is not None:
+            server.log_event("server.stopped" if result == 0 else "server.failed",
+                             "INFO" if result == 0 else "ERROR")
+            try:
+                server.events.close()
+            except Exception:
+                log.exception("Log writer cleanup failed")
                 result = 1
     return result
 

@@ -11,6 +11,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 import json
 import logging
+import os
+import tempfile
 import queue
 import threading
 from collab.server.trace import classify, REQUIREMENTS, is_activity_event
@@ -44,13 +46,34 @@ class EventJournal:
         self.write_errors = 0
 
     def start_file(self, path):
-        """Create a rotating file: 5 MiB plus three backups; call before serving."""
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        """Create a unique UTC-stamped log per run, with three rotating backups.
+
+        The supplied path is a filename template, not a file to append to. Exclusive
+        creation keeps simultaneous starts separate even when their timestamps match.
+        Returns the actual path for the startup message.
+        """
+        if self._handler is not None:
+            raise RuntimeError("Log writer has already been started")
+        template = Path(path)
+        template.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        fd, filename = tempfile.mkstemp(
+            prefix=f"{template.stem}-{stamp}-",
+            suffix=template.suffix or ".jsonl",
+            dir=template.parent,
+        )
+        os.close(fd)
+        actual = Path(filename).resolve()
         self._handler = RotatingFileHandler(
-            path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            actual, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
         self._thread = threading.Thread(target=self._write, name="collab-log", daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            self._handler.close()
+            raise
+        return actual
 
     def emit(self, event, level="INFO", **fields):
         with self._lock:

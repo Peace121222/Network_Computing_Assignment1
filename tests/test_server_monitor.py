@@ -38,6 +38,30 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(len(snapshot["activity"]), 3)
         self.assertEqual(snapshot["activity_evicted"], 2)
 
+    def test_each_run_creates_its_own_file_without_appending_existing_logs(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as root:
+            template = Path(root) / "server.jsonl"
+            template.write_text("previous log\n")
+            paths = []
+            with patch("collab.server.monitor.datetime") as clock:
+                clock.now.return_value = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+                for user in ("alice", "bob"):
+                    journal = EventJournal()
+                    path = journal.start_file(template)
+                    journal.emit("login.succeeded", user=user)
+                    journal.close()
+                    paths.append(path)
+            self.assertNotEqual(paths[0], paths[1])
+            self.assertEqual(template.read_text(), "previous log\n")
+            for path, user in zip(paths, ("alice", "bob")):
+                self.assertTrue(path.name.startswith("server-20261103T120000.000000Z-"))
+                self.assertEqual(path.suffix, ".jsonl")
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual([row["details"]["user"] for row in rows], [user])
+
     def test_file_flush_rotation_and_json_lines(self):
         with tempfile.TemporaryDirectory() as root:
             journal = EventJournal()

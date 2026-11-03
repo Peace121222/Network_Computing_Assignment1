@@ -1266,7 +1266,8 @@ def main() -> int:
     parser.add_argument("--database", default="accounts.sqlite3")
     parser.add_argument("--auth-limit", type=int, default=10)
     parser.add_argument("--auth-window", type=float, default=60)
-    parser.add_argument("--log-file", default="logs/server.jsonl")
+    parser.add_argument("--log-file", default="logs/server.jsonl",
+                        help="Filename template; a UTC timestamp and unique suffix are added per run")
     parser.add_argument("--log-web-port", type=int, default=None,
                         help="Enable local read-only server log UI, e.g. 8090")
     parser.add_argument("--trace-network", action="store_true",
@@ -1287,7 +1288,8 @@ def main() -> int:
             keyfile=args.key,
             trace_network=args.trace_network,
         )
-        server.events.start_file(args.log_file)
+        log_path = server.events.start_file(args.log_file)
+        print("Log file: " + str(log_path), flush=True)
         if args.log_web_port is not None:
             console = LogConsole(server.events, args.log_web_port)
             print("Server log: " + console.url, flush=True)

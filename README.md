@@ -240,8 +240,14 @@ Default demo evidence visible on this page:
   the traffic. TCP raw TLS ciphertext is not exposed through Python SSL sockets.
 
 The CLI records operational events in the terminal and rotating JSON-lines files
-at `logs/server.jsonl` by default. Use `--log-file PATH` for another location.
-Files rotate at 5 MiB with three backups. A separate writer has a 2,048-event queue;
+in a new file for each server run, such as
+`logs/server-20261103T120000.000000Z-abcdefgh.jsonl`. The timestamp is UTC (`Z`),
+and the unique suffix prevents collisions between simultaneous starts. The startup
+terminal prints the actual **Log file:** path. Existing files are never appended
+to on a new run. `--log-file PATH` selects the directory/base name/extension template;
+for example, `--log-file logs/demo.jsonl` creates `logs/demo-<UTC time>-<unique>.jsonl`.
+Within each run, files rotate at 5 MiB with three backups. Files from earlier runs
+are retained; this is not a global retention limit. A separate writer has a 2,048-event queue;
 queue saturation drops file events instead of blocking network workers. Protect
 the directory because events include usernames, peer IPs and transaction IDs.
 No passwords, session keys or message/file plaintext are recorded. Existing Python

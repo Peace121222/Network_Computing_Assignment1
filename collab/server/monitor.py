@@ -141,7 +141,7 @@ class EventJournal:
 class LogConsole:
     """Read-only local console; no account, payload or key inspection endpoints."""
 
-    def __init__(self, journal, port):
+    def __init__(self, journal, port, users_snapshot=None):
         static = Path(__file__).with_name("static")
 
         class Handler(BaseHTTPRequestHandler):
@@ -171,6 +171,10 @@ class LogConsole:
                     if path == "/api/activity":
                         snapshot = {key: snapshot[key] for key in
                                     ("activity", "activity_evicted", "dropped", "write_errors")}
+                    body = json.dumps(snapshot).encode()
+                    content_type = "application/json"
+                elif path == "/api/users":
+                    snapshot = users_snapshot() if users_snapshot else dict(users=[], count=0)
                     body = json.dumps(snapshot).encode()
                     content_type = "application/json"
                 elif path in files:

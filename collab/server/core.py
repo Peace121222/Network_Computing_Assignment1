@@ -493,6 +493,23 @@ class Server:
         finally:
             self._lifecycle_lock.release()
 
+    def connected_users_snapshot(self):
+        """Copy public endpoint metadata under the registry lock for the console."""
+        with self.lock:
+            rows = []
+            for name, user in sorted(self.users.items()):
+                if not user["ready"]:
+                    continue
+                tcp = user["tcp_addr"]
+                udp = user["udp_addr"]
+                rows.append(dict(
+                    username=name, ip_address=tcp[0], tcp_port=tcp[1],
+                    udp_ip_address=udp[0] if udp else None,
+                    udp_port=udp[1] if udp else None,
+                    status="Online" if udp else "Pending verification",
+                ))
+            return dict(users=rows, count=len(rows))
+
     def _snapshot_locked(self, typ: str = "presence") -> dict[str, Any]:
         """Build an online-user snapshot from ready sessions.
 
@@ -1291,7 +1308,7 @@ def main() -> int:
         log_path = server.events.start_file(args.log_file)
         print("Log file: " + str(log_path), flush=True)
         if args.log_web_port is not None:
-            console = LogConsole(server.events, args.log_web_port)
+            console = LogConsole(server.events, args.log_web_port, server.connected_users_snapshot)
             print("Server log: " + console.url, flush=True)
         server.start()
         server.stopping.wait()

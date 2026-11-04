@@ -95,12 +95,30 @@ function render() {
   $('empty').hidden = rows.length > 0;
   $('empty').textContent = entries.length ? 'No activity matches your filters.' : 'Waiting for server activity.';
 }
+function renderUsers(data) {
+  const users = data.users || [];
+  $('users-rows').replaceChildren(...users.map(user => {
+    const tr = document.createElement('tr');
+    const values = [user.username, user.ip_address, user.tcp_port,
+      user.udp_ip_address ?? 'Pending verification', user.udp_port ?? '—', user.status];
+    values.forEach(value => {
+      const td = document.createElement('td');
+      td.textContent = String(value);
+      tr.append(td);
+    });
+    return tr;
+  }));
+  $('users-count').textContent = `${users.length} connected`;
+  $('users-empty').hidden = users.length > 0;
+}
 async function refresh() {
   if (!paused) {
     try {
-      const response = await fetch('/api/activity', {signal:AbortSignal.timeout(4000)});
-      if (!response.ok) throw Error('Could not load server activity');
-      const data = await response.json();
+      const responses = await Promise.all(['/api/activity', '/api/users'].map(path =>
+        fetch(path, {signal:AbortSignal.timeout(4000)})));
+      if (responses.some(response => !response.ok)) throw Error('Could not load server state');
+      const [data, users] = await Promise.all(responses.map(response => response.json()));
+      renderUsers(users);
       entries = data.activity || data.events.filter(isActivity);
       const retainedIds = new Set(entries.map(entry => entry.id));
       for (const id of expanded) if (!retainedIds.has(id)) expanded.delete(id);
@@ -112,6 +130,7 @@ async function refresh() {
       $('retention').textContent = `Latest 1,000 activity events · newest first · updates every second.${evicted ? ' ' + evicted + ' older activity events are no longer in this view.' : ''}`;
       render();
     } catch (error) {
+      $('users-count').textContent = 'Stale · reconnecting';
       $('connection').textContent = 'Disconnected · retrying' + (lastGood ? ' · last update ' + lastGood : '');
     }
   }

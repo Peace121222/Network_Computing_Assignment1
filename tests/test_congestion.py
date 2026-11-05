@@ -156,6 +156,7 @@ class RelayCongestionTests(unittest.TestCase):
             for i, name in enumerate(("alice", "bob", "carol"))
         }
         server = SimpleNamespace(
+            trace_network=False,
             lock=threading.RLock(),
             users=users,
             pending={},

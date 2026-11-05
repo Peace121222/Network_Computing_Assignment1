@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Log in</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/auth.js" defer></script>
+</head>
+<body class="auth-page" data-mode="login">
+<main class="auth-shell">
+<section class="auth-card" aria-labelledby="auth-title">
+<h1 id="auth-title">Log in</h1>
+<form id="auth-form">
+<label for="username">Username</label>
+<input id="username" name="username" autocomplete="username" maxlength="24" required autofocus>
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" minlength="8" maxlength="128" required>
+<p id="auth-status" class="auth-status" role="status" aria-live="polite"></p>
+<button id="auth-submit" type="submit">Log in</button>
+</form>
+<a class="auth-switch" href="/signup">Create an account</a>
+</section>
+</main>
+</body>
+</html>

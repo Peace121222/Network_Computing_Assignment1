@@ -161,11 +161,109 @@ python -m collab.web --name bob --ca certs/ca.crt \
   --web-port 8081 --downloads downloads/bob
 ```
 
-Complete the same terminal login menu. The backend opens its HTTP listener only after successful login and prints the website address. Open [Alice's interface](http://127.0.0.1:8080) and [Bob's interface](http://127.0.0.1:8081). Select a recipient to send chat or choose a file for upload.
+The backend immediately prints its browser login URL; no terminal account menu is
+shown for Web clients. Open [Alice's login](http://127.0.0.1:8080/login) and
+[Bob's login](http://127.0.0.1:8081/login). Use **Create an account** to open the
+separate `/signup` page, then log in at `/login`. The `--name` option only prefills
+the username. Server address, CA and download location remain configured by the
+startup command. Account authentication with the network server still uses TLS.
 
-For a third account, run `--name carol --web-port 8082 --downloads downloads/carol` with the same CA and register Carol in the terminal.
+After login, `/` opens a header-free, dark two-pane workspace: account/presence and
+recipient list on the left, selected conversation and message/file composer on the
+right. Private and broadcast messages are shown in their own conversations. File transfers appear as cards
+inside their matching conversation, with progress and verified completion. Private
+incoming files belong to the sender's conversation; broadcast files belong to
+Everyone. Switching conversations does not move an in-progress or completed file.
+The selected upload recipient is captured before reading the file, so changing
+channels during upload does not change its destination. **Log out** closes the client
+session and returns to `/login`, while keeping the Web backend available.
 
-HTTP always binds to `127.0.0.1`; open it on the machine running that backend. Closing a browser tab does not log out. Use Ctrl+C in the backend terminal to stop its client session.
+For a third account, run `--name carol --web-port 8082 --downloads downloads/carol` with the same CA and register Carol at <http://127.0.0.1:8082/signup>.
+
+HTTP always binds to `127.0.0.1`; open it on the machine running that backend. Closing a browser tab does not log out. Use the workspace's **Log out** button or
+Ctrl+C in the backend terminal to stop its client session. The browser-to-backend
+connection is local HTTP; the backend-to-network-server connection uses verified
+TLS. Browser authentication uses an HttpOnly, SameSite=Strict cookie with a separate
+name per local backend port, plus Host/Origin checks. Unauthenticated requests cannot
+read events or submit chat/files. Passwords are not stored in browser storage.
+One backend serves one account; multiple tabs still share its consumed event queue.
+The CLI keeps its existing terminal registration/login menu.
+
+## Server log console
+
+Enable the simple, read-only activity page in the server terminal:
+
+```bash
+python -m collab.server \
+  --host 127.0.0.1 --tcp-port 9000 --udp-port 9001 \
+  --cert certs/server.crt --key certs/server.key \
+  --database accounts.sqlite3 \
+  --log-file logs/server.jsonl --log-web-port 8090
+```
+
+Open <http://127.0.0.1:8090> on the **server machine**. The dark interface shows
+three columns: local time, severity and a readable activity description. Search
+by user/activity, filter Info/Warning/Error, or pause/resume updates. It focuses
+on connections, account registration/login, session removal, message outcomes,
+file start/completion/failure and server errors. A file success is a receiver's
+confirmation of verification and saving, not an independent server hash check.
+
+The page keeps the latest 1,000 activity events, newest first, polling once per
+second. This buffer is separate from packet traces, so heartbeats/ACKs cannot
+push activity out of the view. Restarting clears the buffers. Multiple log tabs
+read snapshots independently. Log-file drop/write-error notices appear only
+when there is a problem. The table stays at three columns. Relevant rows have a collapsed **Details** or
+**Packet & encryption details** section for the demo; there is no rubric dashboard
+or per-packet table.
+
+Default demo evidence visible on this page:
+
+- **Protocol design:** expand an encrypted chat/file row to show the real logical
+  JSON structure with payload redacted. Use the report/code for binary headers and
+  state diagrams; logs do not establish when a design was documented.
+- **TCP handshake/authentication:** TCP accepted IP:port, successful TLS version and
+  cipher, then the application's welcome acknowledgment and login result. This is
+  separate from TCP's kernel SYN/ACK exchange.
+- **Reliable file:** file start, first/last chunk accepted by the server, end marker,
+  and recipient-confirmed completion/failure. File chunks are sampled milestones,
+  not a full chunk dump. Compare source/received SHA-256 separately when presenting.
+- **Resilience:** disconnect/session expiry, retry attempts and retry exhaustion
+  appear only when they actually occur. Ctrl+C is a handled exit; use a crash or
+  controlled network-loss test for sudden failure. TCP loss may be detected before
+  the ten-second heartbeat expiry.
+- **Encryption:** the chat, file start/end and first file-chunk send each expose a
+  bounded sample of actual AES ciphertext plus the actual on-wire Fernet prefix.
+  These come from the datagram submitted to `sendto`, not synthetic examples. Retry
+  copies are deduplicated in a bounded per-recipient cache. Keys, account passwords,
+  session tokens and message/file plaintext remain hidden. Expand the row to inspect
+  it; open details survive normal polling. Wireshark can independently corroborate
+  the traffic. TCP raw TLS ciphertext is not exposed through Python SSL sockets.
+
+The CLI records operational events in the terminal and rotating JSON-lines files
+in a new file for each server run, such as
+`logs/server-20261103T120000.000000Z-abcdefgh.jsonl`. The timestamp is UTC (`Z`),
+and the unique suffix prevents collisions between simultaneous starts. The startup
+terminal prints the actual **Log file:** path. Existing files are never appended
+to on a new run. `--log-file PATH` selects the directory/base name/extension template;
+for example, `--log-file logs/demo.jsonl` creates `logs/demo-<UTC time>-<unique>.jsonl`.
+Within each run, files rotate at 5 MiB with three backups. Files from earlier runs
+are retained; this is not a global retention limit. A separate writer has a 2,048-event queue;
+queue saturation drops file events instead of blocking network workers. Protect
+the directory because events include usernames, peer IPs and transaction IDs.
+No passwords, session keys or message/file plaintext are recorded. Existing Python
+exception tracebacks stay in the terminal, not in the structured event journal.
+
+Detailed instrumentation remains optional: append `--trace-network` to collect
+TCP/UDP frames, application ACKs, retry and CUBIC diagnostics in the JSONL file.
+The normal demo milestones are available without this flag; packet traces stay out of the simple UI. `/api/events` retains the bounded raw diagnostic
+snapshot for tools; the page uses the smaller `/api/activity` endpoint. Network
+traces and their ciphertext previews are application diagnostics, not a packet
+capture. TCP kernel flags/ACKs, IP fragments and raw TLS ciphertext require a tool
+such as Wireshark. Detailed trace events can rotate the log files quickly.
+
+The HTTP console binds only to IPv4 loopback and has no account login. It is for
+trusted users on the server machine, not LAN exposure. Archived files are not
+loaded into the page. File timestamps are UTC; the page displays local time.
 
 ## Configuration
 
@@ -293,7 +391,7 @@ python -m compileall -q collab tests scripts docs/build_report.py
 git diff --check
 ```
 
-The suite has 12 test modules. Authentication and handshake checks share `test_authentication.py`; browser and HTTP capacity checks share `test_web.py`; `test_integration.py` includes the production-scale and data-hop-loss cases. Chat, files, protocol, security, sessions, concurrency, resilience, congestion, and compatibility checks remain separate. Shared account/TLS fixtures live in `tests/auth_support.py`, and scripted socket doubles live in `tests/stream_support.py`.
+The suite has 14 test modules. Authentication and handshake checks share `test_authentication.py`; browser and HTTP capacity checks share `test_web.py`, and browser account flows are in `test_browser_auth.py`; `test_integration.py` includes the production-scale and data-hop-loss cases. Chat, files, protocol, security, sessions, concurrency, resilience, congestion, and compatibility checks remain separate. Shared account/TLS fixtures live in `tests/auth_support.py`, and scripted socket doubles live in `tests/stream_support.py`.
 
 Tests use disposable databases, certificates, account names, files, and OS-assigned localhost ports. Socket binding must be permitted in your environment. One JavaScript test is skipped if Node.js is absent. Some tests deliberately inject worker/disk/cleanup failures and print tracebacks even on success; use the final summary and process exit code to determine the result.
 
@@ -318,7 +416,7 @@ No lint or static type checker is configured, and Ruff, mypy, and Pyright are no
 | `Too many authentication attempts; try later` | Wait for the configured source-IP window to expire (60 seconds by default). Users behind one NAT share the limit. |
 | `Address already in use` | Stop the old listener or select unused TCP/UDP/Web ports. Each local Web backend needs a separate `--web-port`. |
 | Login works but presence/file delivery fails | Check bidirectional UDP, the server UDP port, firewall rules, and heartbeat expiry. After changing network/address/port, close the client and log in again. |
-| Web page does not open | Finish terminal login first, keep the backend running, and open its printed localhost URL on that machine. |
+| Web page does not open | Keep the backend running, open its printed localhost `/login` URL on that machine, and sign in there. |
 | File was sent but is not complete | Wait for the completion event; look in the recipient's configured downloads directory for the prefixed filename. HTTP acceptance or chunk ACKs alone do not mean completion. |
 | Cannot open/write the database | Ensure its parent exists, the path is writable, and another process is not holding a long SQLite write lock. |
 

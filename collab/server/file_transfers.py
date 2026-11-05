@@ -68,6 +68,13 @@ class ServerFileTransfers:
 
         The caller must hold server.lock. A replacement source login receives no result.
         """
+        if record["result"] is not None and not record.get("event_logged"):
+            self.server.log_event("file.result", user=record["source"],
+                                  transfer=record["transfer"],
+                                  state=record["result"]["state"],
+                                  recipient=record["channel"],
+                                  level="INFO" if record["result"]["state"] == "delivered" else "WARNING")
+            record["event_logged"] = True
         source = self.server.users.get(record["source"])
         if source is not None and source["token"] == record["source_token"]:
             self.queue(source, ("source", record["transfer"]), self.status(record))
@@ -306,6 +313,10 @@ class ServerFileTransfers:
             if not self.queue(source, ("source", transfer), self.status(record)):
                 return False
             self.records[key] = record
+            self.server.log_event("file.started" if reason is None else "file.rejected",
+                                  "INFO" if reason is None else "WARNING",
+                                  user=record["source"], recipient=record["channel"],
+                                  transfer=transfer, bytes=record["meta"]["size"])
         if msg["to"] != record["channel"]:
             return False
         if record["result"] is not None:
@@ -368,7 +379,8 @@ class ServerFileTransfers:
                 "from": msg["from"],
                 "to": name,
                 "payload": msg["payload"],
-                "meta": dict(msg["meta"], sender_session=record["sender_session"]),
+                "meta": dict(msg["meta"], sender_session=record["sender_session"],
+                             **({"channel": record["channel"]} if kind == "file_start" else {})),
             }
             if udp_frame_size(packet) > UDP_MTU:
                 for recipient in record["states"]:
@@ -377,6 +389,12 @@ class ServerFileTransfers:
             plans.append((name, user, packet))
         record["packets"][slot] = fingerprint
         record["chunks"] += kind == "file_chunk"
+        if kind == "file_chunk" and msg["meta"]["index"] in (0, record["meta"]["count"] - 1):
+            server.log_event("file.chunk_received", user=record["source"], recipient=record["channel"],
+                             transfer=transfer, index=msg["meta"]["index"], count=record["meta"]["count"])
+        elif kind == "file_end":
+            server.log_event("file.end_received", user=record["source"], recipient=record["channel"],
+                             transfer=transfer, count=record["chunks"])
         record["progress"] = now
         for name, user, packet in plans:
             server.pending[(name, relay_id)] = dict(

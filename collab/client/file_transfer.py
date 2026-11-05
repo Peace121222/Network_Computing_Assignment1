@@ -132,6 +132,7 @@ class FileTransfers:
                 "sender_session": f["epoch"],
                 "from": key[0],
                 "filename": f["name"],
+                "channel": f["channel"],
             }
         )
 
@@ -216,6 +217,11 @@ class FileTransfers:
                     {
                         "type": "error",
                         "message": "Incoming file transfer capacity exceeded",
+                        "transfer": transfer,
+                        "sender_session": epoch,
+                        "from": msg["from"],
+                        "filename": meta["filename"],
+                        "channel": meta.get("channel", msg.get("to", client.name)),
                     }
                 )
                 return False
@@ -239,6 +245,7 @@ class FileTransfers:
                 "progress": now,
                 "epoch": epoch,
                 "sender": msg["from"],
+                "channel": meta.get("channel", msg.get("to", client.name)),
                 "transfer": transfer,
                 "session": session,
             }
@@ -405,6 +412,7 @@ class FileTransfers:
                                         "sender_session": f["epoch"],
                                         "from": key[0],
                                         "filename": f["name"],
+                                        "channel": f["channel"],
                                         "total": f["total"],
                                     }
                                 )
@@ -432,6 +440,7 @@ class FileTransfers:
                                             "type": "file_progress",
                                             "from": key[0],
                                             "filename": f["name"],
+                                            "channel": f["channel"],
                                             "transfer": key[1],
                                             "sender_session": f["epoch"],
                                             "received": len(f["written"]),
@@ -497,6 +506,7 @@ class FileTransfers:
                         "type": "file_complete",
                         "from": key[0],
                         "filename": f["name"],
+                        "channel": f["channel"],
                         "path": str(destination),
                         "size": size,
                         "transfer": key[1],
@@ -593,6 +603,7 @@ class FileTransfers:
                     "type": "file_sending",
                     "transfer": transfer,
                     "to": recipient,
+                    "channel": recipient,
                     "filename": path.name,
                 }
             )
@@ -651,7 +662,7 @@ class FileTransfers:
                         **{
                             "from": client.name,
                             "to": relay_destination,
-                            "meta": dict(meta, sender_session="0" * 32),
+                            "meta": dict(meta, sender_session="0" * 32, channel=recipient),
                         },
                     ),
                 )
@@ -693,6 +704,7 @@ class FileTransfers:
                                     "type": "file_send_progress",
                                     "transfer": transfer,
                                     "to": recipient,
+                                    "channel": recipient,
                                     "filename": path.name,
                                     "sent": index,
                                     "total": meta["count"],
@@ -726,6 +738,7 @@ class FileTransfers:
                         "transfer": transfer,
                         "filename": path.name,
                         "to": recipient,
+                        "channel": recipient,
                         "size": meta["size"],
                     }
                 )
@@ -744,6 +757,7 @@ class FileTransfers:
                             "type": "file_send_failed",
                             "transfer": transfer,
                             "to": recipient,
+                            "channel": recipient,
                             "reason": str(exc),
                             "result": record["result"],
                         }

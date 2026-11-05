@@ -283,31 +283,22 @@ class TerminalAuthenticationTests(unittest.TestCase):
             self.assertIsNone(authenticate(opts))
         client.close.assert_called_once()
 
-    def test_web_opens_http_only_after_terminal_authentication(self):
+    def test_web_opens_login_page_without_terminal_authentication(self):
         from unittest.mock import Mock, patch
         from collab.web import cli
 
-        client = Mock(name="alice")
-        order = []
-
-        def authenticate(opts):
-            order.append("authenticated")
-            return client
-
-        http = Mock()
-
-        def open_http(*args):
-            order.append("http")
-            return http
-
+        client, http = Mock(), Mock()
         with (
-            patch.object(cli, "authenticate", side_effect=authenticate),
-            patch.object(cli, "BoundedHTTPServer", side_effect=open_http),
+            patch.object(cli, "Client", return_value=client),
+            patch.object(cli, "handler_factory") as factory,
+            patch.object(cli, "BoundedHTTPServer", return_value=http),
             patch("sys.argv", ["web", "--ca", "ca.crt"]),
             patch("builtins.print"),
         ):
             self.assertEqual(cli.main(), 0)
-        self.assertEqual(order, ["authenticated", "http"])
+        client.connect.assert_not_called()
+        self.assertIs(factory.call_args.kwargs["auth"].client, client)
+        http.serve_forever.assert_called_once()
         http.server_close.assert_called_once()
 
 

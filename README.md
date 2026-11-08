@@ -343,6 +343,39 @@ Acceptance checks on October 31, 2026, after simplification used three separate 
 
 A second physical device, Windows/Linux execution, and instructor confirmation remain unverified. Instructor questions concern TCP versus UDP transfer wording, server-mediated presence versus LAN broadcast discovery, and acceptance of the application-level CUBIC adaptation.
 
+### Live 20-client demo
+
+From the repository root, start the server with enough authentication capacity:
+
+```bash
+python -m collab.server --host 127.0.0.1 \
+  --cert certs/server.crt --key certs/server.key \
+  --database demo-accounts.sqlite3 --auth-limit 60 --log-web-port 8090
+```
+
+In another terminal with the environment activated:
+
+```bash
+python scripts/demo_20_clients.py
+```
+
+The script uses accounts `load00` through `load19` and the fixed demo password
+`demo1234`, without prompting for a password. It registers missing accounts with
+that password; an `Username already registered` response makes it reuse the
+existing account and log in with `demo1234`. Other registration errors stop the
+run. Existing accounts must already use `demo1234`; their passwords are not reset.
+Accounts remain in the server database for subsequent runs.
+
+After all 20 clients see one another, the script sends 20 private messages, one
+from each client to the next. It waits for Enter so you can capture the server
+console at <http://127.0.0.1:8090>, then closes the clients. Keep these demo accounts
+offline elsewhere while running it. Each run uses 40 authentication attempts
+(registration checks plus logins); repeated runs share the server's source-IP
+budget, so wait for the window to expire if necessary.
+
+Use `--prefix test` to select `test00` through `test19`. For another server, pass
+`--host`, `--port`, and `--ca`; its certificate must cover the selected host.
+
 ## Protocol and resource ownership
 
 Authentication JSON uses four-byte length-prefixed frames inside verified TLS: `register → registered/error` or `login → welcome/error`. A successful login returns an independent random token, public session ID, Fernet key, and server UDP port. Account storage contains only `id`, `username`, `password_hash`, and `created_at`; session keys are never stored in SQLite or printed.

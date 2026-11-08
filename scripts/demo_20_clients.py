@@ -2,12 +2,12 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from getpass import getpass
 from pathlib import Path
 import sys
 import time
 
-PROJECT = Path("/Users/tathanhbinh/Desktop/Network_Computing_Assignment1")
+PROJECT = Path(__file__).resolve().parents[1]
+DEMO_PASSWORD = "demo1234"
 sys.path.insert(0, str(PROJECT))
 from collab.client import Client  # noqa: E402
 
@@ -19,9 +19,6 @@ def main():
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--ca", default=str(PROJECT / "certs/ca.crt"))
     args = parser.parse_args()
-    password = getpass("Password for 20 new test accounts (8–128 characters): ")
-    if len(password) < 8:
-        parser.error("Password must contain at least 8 characters")
 
     names = [f"{args.prefix}{i:02d}" for i in range(20)]
     clients = [
@@ -31,11 +28,17 @@ def main():
     ]
     try:
         for client in clients:
-            client.register(password, password)
-            print(f"Registered {client.name}", flush=True)
+            try:
+                client.register(DEMO_PASSWORD, DEMO_PASSWORD)
+            except RuntimeError as exc:
+                if str(exc) != "Username already registered":
+                    raise
+                print(f"Account {client.name} already exists; logging in.", flush=True)
+            else:
+                print(f"Registered {client.name}", flush=True)
 
         with ThreadPoolExecutor(max_workers=20) as pool:
-            list(pool.map(lambda client: client.connect(password), clients))
+            list(pool.map(lambda client: client.connect(DEMO_PASSWORD), clients))
         deadline = time.monotonic() + 15
         while not all(len(client.names) == 20 for client in clients):
             if time.monotonic() > deadline:

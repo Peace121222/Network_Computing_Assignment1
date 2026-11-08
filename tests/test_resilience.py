@@ -191,17 +191,18 @@ class CLITests(unittest.TestCase):
         server.close.assert_called_once()
         self.assertIn("fatal UDP", err.getvalue())
 
-    def test_web_auth_failure_does_not_open_http(self):
+    def test_web_opens_login_without_authenticating_in_terminal(self):
         with (
-            patch.object(
-                web_cli, "authenticate", side_effect=ConnectionRefusedError("no server")
-            ),
+            patch.object(web_cli, "Client") as client,
+            patch.object(web_cli, "handler_factory"),
             patch.object(web_cli, "BoundedHTTPServer") as http,
             patch("sys.argv", ["web", "--ca", "fixture-ca"]),
-            contextlib.redirect_stderr(io.StringIO()),
         ):
-            self.assertEqual(web_cli.main(), 1)
-        http.assert_not_called()
+            http.return_value.serve_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(web_cli.main(), 0)
+        http.assert_called_once()
+        client.return_value.connect.assert_not_called()
+        http.return_value.server_close.assert_called_once()
 
 
 class NetworkResilienceTests(unittest.TestCase):

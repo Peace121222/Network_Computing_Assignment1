@@ -163,7 +163,7 @@ class StartupCompatibilityTests(unittest.TestCase):
     def test_client_entry_points_preserve_connection_defaults_and_overrides(self):
         from collab.web import cli as web_cli
 
-        for entry, executable in ((cli, "client"), (web_cli, "web")):
+        for entry, executable in ((cli, "client"),):
             cases = (
                 (
                     ["--ca", "demo-ca.crt"],
@@ -216,6 +216,26 @@ class StartupCompatibilityTests(unittest.TestCase):
                     )
                     if executable == "web":
                         self.assertEqual(parsed.web_port, 8080)
+
+    def test_web_entry_opens_browser_login_with_connection_options(self):
+        from collab.web import cli as web_cli
+
+        with (
+            patch("sys.argv", ["web", "--ca", "demo-ca.crt", "--name", "alice",
+                               "--host", "192.0.2.1", "--port", "9100",
+                               "--downloads", "received", "--web-port", "8081"]),
+            patch.object(web_cli, "Client") as client,
+            patch.object(web_cli, "BoundedHTTPServer") as http,
+            patch.object(web_cli, "handler_factory") as factory,
+        ):
+            http.return_value.serve_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(web_cli.main(), 0)
+            client.assert_called_once_with("alice", "192.0.2.1", 9100, "received",
+                                           cafile="demo-ca.crt", server_name=None)
+            client.return_value.connect.assert_not_called()
+            self.assertEqual(http.call_args.args[0], ("127.0.0.1", 8081))
+            self.assertIn("auth", factory.call_args.kwargs)
+            http.return_value.server_close.assert_called_once()
 
     def test_cli_preserves_message_and_file_contents(self):
         from unittest.mock import Mock

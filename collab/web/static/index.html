@@ -1,27 +1,13 @@
 <!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Collab LAN</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Workspace</title>
 <link rel="stylesheet" href="/static/style.css">
-</head>
-<body><main>
-<h1>Collab LAN</h1>
-<p class="muted">User: <b id="self"></b> · <span id="connection" role="status">Connecting...</span></p>
-<p>Online: <span id="online">Connecting...</span></p>
-<div id="messages" role="log" aria-live="polite"></div>
-<section>
-<select id="to" aria-label="Recipient"><option value="*">Everyone</option></select>
-<input id="message" maxlength="1000" placeholder="Type a message" aria-label="Message">
-<button id="send-chat" onclick="sendChat()" disabled>Send</button>
-</section>
-<section>
-<input type="file" id="file" aria-label="File to send">
-<button id="send-file" onclick="sendFile()" disabled>Send file (max 25 MiB)</button>
-</section>
-<div id="transfers" aria-label="File transfers"></div>
-<p id="status" class="muted" role="status">Ready</p>
-</main>
-<script src="/static/app.js" defer></script>
-</body></html>
+<script src="/static/app.js" defer></script></head>
+<body class="workspace-page"><main class="workspace">
+<aside class="sidebar" aria-label="Workspace and people"><div class="account"><h1>Your workspace</h1><div class="identity"><span id="avatar" class="avatar" aria-hidden="true">—</span><div><strong id="self">Connecting…</strong><p id="connection" role="status">Connecting…</p></div></div></div>
+<div class="people"><div class="section-label"><h2>Channels &amp; people</h2><span id="online-count">0 online</span></div><label class="sr-only" for="to">Choose a conversation</label><select id="to" size="12"><option value="*"># Everyone</option></select><p id="online" class="muted">Connecting…</p></div>
+<div class="sidebar-footer"><span>Private network workspace</span><button id="logout" class="secondary">Log out</button></div></aside>
+<section class="conversation" aria-label="Conversation"><div class="conversation-heading"><div><p class="eyebrow">Your network, connected</p><h2 id="chat-title">Everyone</h2><p id="chat-subtitle" class="muted">Messages shared with everyone online.</p></div><span id="conversation-count" class="muted">0 online</span></div>
+<div id="messages" class="messages" role="log" aria-live="polite"><div id="empty-chat" class="empty-chat"><span class="empty-symbol" aria-hidden="true">↗</span><h3>A conversation starts here.</h3><p>Choose someone from your workspace or say hello to everyone.</p></div></div>
+<div class="composer"><p id="status" class="muted" role="status">Ready</p><form id="chat-form" class="message-form"><label class="sr-only" for="message">Message</label><input id="message" maxlength="1000" placeholder="Write a message…" autocomplete="off"><button id="send-chat" disabled>Send <span aria-hidden="true">↗</span></button></form>
+<div class="file-composer"><label class="file-picker" for="file">Share a file <span>Up to 25 MiB</span></label><input type="file" id="file" aria-label="File to send"><button id="send-file" class="secondary" disabled>Send file</button></div></div></section>
+</main></body></html>

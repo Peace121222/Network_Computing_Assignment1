@@ -109,7 +109,18 @@ class ConcurrencyNetworkTests(unittest.TestCase):
         self.env.start()
         self.temp = tempfile.TemporaryDirectory()
         self.server = Server("127.0.0.1", 0, 0)
+        self.addCleanup(self.server.events.close)
+        log_template = os.environ.get("COLLAB_TEST_LOG_FILE")
+        if log_template:
+            log_path = self.server.events.start_file(log_template)
+            print(f"Test server log: {log_path}", flush=True)
         self.server.start()
+        if log_template:
+            print(
+                f"Test server ports: TCP={self.server.tcp_port} "
+                f"UDP={self.server.udp_port}",
+                flush=True,
+            )
         self.clients = []
 
     def tearDown(self):
